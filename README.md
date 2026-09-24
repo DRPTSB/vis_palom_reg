@@ -1,5 +1,7 @@
 # visium-hires-cytassist-registration
 
+Repo: https://github.com/DRPTSB/vis_palom_reg
+
 Registers a VisiumHD/CytAssist HiRes microscopy image to its CytAssist reference
 image, producing the inputs Space Ranger needs for manual alignment: a
 corrected image with the local (block-wise) warp baked in, and a global affine
@@ -112,6 +114,17 @@ python build_full_res_deliverables.py \
 Streams the output to disk in row-bands (never holds the full ~20GB image
 in memory); pass `--checkpoint` on a RAM/time-constrained machine to cache
 progress in a resumable zarr store.
+
+The output is a genuinely pyramidal OME-TIFF (a native-resolution base level
+plus several downsampled SubIFD levels), so viewers like QuPath can zoom
+smoothly instead of loading the full native-resolution image at once. Extra
+levels are accumulated in memory from the same row-bands already being
+streamed to the base level (no second pass over the image), and the first
+(largest) extra level's downsample factor is chosen from the image's own
+size so its accumulator stays under a fixed byte budget (~150MB) — a fixed
+downsample factor is *not* safe here: a 4x-downsample first level is ~1.5GB
+for an 80k x 98k image but ~2.6GB for a 90k x 156k image, which OOM-killed a
+~3.8GB-RAM machine in practice.
 
 ## Coordinate spaces
 

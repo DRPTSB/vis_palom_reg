@@ -168,7 +168,39 @@ def corrected_band(h0, correction, r0, r1):
     return out
 
 
+def _pyramid_levels(h0_shape, first_level_target_bytes=150_000_000, step=4,
+                     min_long_side=1024, max_levels=6):
+    """Downsample factors for extra pyramid levels (beyond the native-res base).
+
+    H0 images here range from ~1GB to 40GB+ (raw), on machines with only
+    ~3.5-4GB free RAM, so the first (largest) extra level's accumulator size
+    must be bounded by the IMAGE'S OWN size, not a fixed factor -- a fixed
+    4x-downsample first level is ~1.5GB for an 80k x 98k image (fine) but
+    ~2.6GB for a 90k x 156k image (OOM-killed in practice). Start from the
+    smallest power-of-2 factor that keeps the first level under the target
+    byte budget, then step down `step`x (area) per further level.
+    """
+    h, w = h0_shape
+    f = 1
+    while (h // f) * (w // f) * 3 > first_level_target_bytes:
+        f *= 2
+    factors = []
+    while len(factors) < max_levels:
+        lvl_h, lvl_w = h // f, w // f
+        factors.append(f)
+        if max(lvl_h, lvl_w) <= min_long_side:
+            break
+        f *= step
+    return factors
+
+
 def write_local_warp_tiff(h0, correction, out_path, um_per_px, checkpoint_dir=None):
+    """Writes a genuinely pyramidal OME-TIFF: the native-resolution base level
+    plus several downsampled SubIFD levels, so viewers like QuPath can zoom
+    smoothly instead of loading the full native-resolution image at once.
+    Pyramid levels are built on the fly from the same row-bands streamed into
+    the base level -- no extra pass over the image, memory stays bounded
+    because each level is >=16x smaller in area than the last."""
     H0_h, H0_w = h0.shape[:2]
     n_bands = (H0_h + WRITE_TILE - 1) // WRITE_TILE
 
@@ -179,6 +211,10 @@ def write_local_warp_tiff(h0, correction, out_path, um_per_px, checkpoint_dir=No
             root.create_dataset("corrected", shape=(H0_h, H0_w, 3), chunks=(WRITE_TILE, 4096, 3), dtype="uint8")
             root.create_dataset("done", shape=(n_bands,), dtype="bool", fill_value=False)
         cache = root
+
+    pyramid_factors = _pyramid_levels((H0_h, H0_w))
+    pyramid_accum = [np.zeros((H0_h // f, H0_w // f, 3), dtype=np.uint8) for f in pyramid_factors]
+    print(f"pyramid levels (downsample factors): {pyramid_factors}", flush=True)
 
     def bands():
         for bi in range(n_bands):
@@ -192,14 +228,25 @@ def write_local_warp_tiff(h0, correction, out_path, um_per_px, checkpoint_dir=No
                     cache["done"][bi] = True
             if bi % 20 == 0:
                 print(f"band {bi + 1}/{n_bands}", flush=True)
+            for f, accum in zip(pyramid_factors, pyramid_accum):
+                lvl_r0, lvl_r1 = r0 // f, min(r1 // f, accum.shape[0])
+                if lvl_r1 > lvl_r0:
+                    small = cv2.resize(band, (accum.shape[1], lvl_r1 - lvl_r0), interpolation=cv2.INTER_AREA)
+                    accum[lvl_r0:lvl_r1, :, :] = small
             for c0 in range(0, H0_w, WRITE_TILE):
                 c1 = min(c0 + WRITE_TILE, H0_w)
                 yield band[:, c0:c1, :]
 
     res = (1e4 / um_per_px, 1e4 / um_per_px)
-    with tifffile.TiffWriter(out_path, bigtiff=True) as tw:
+    with tifffile.TiffWriter(out_path, bigtiff=True, ome=True) as tw:
         tw.write(bands(), shape=(H0_h, H0_w, 3), dtype=np.uint8, tile=(WRITE_TILE, WRITE_TILE),
-                  photometric="rgb", compression="jpeg", resolution=res, resolutionunit=tifffile.RESUNIT.CENTIMETER)
+                  photometric="rgb", compression="jpeg", resolution=res, resolutionunit=tifffile.RESUNIT.CENTIMETER,
+                  subifds=len(pyramid_factors))
+        for f, accum in zip(pyramid_factors, pyramid_accum):
+            lvl_res = (1e4 / (um_per_px * f), 1e4 / (um_per_px * f))
+            tw.write(accum, subfiletype=1, tile=(WRITE_TILE, WRITE_TILE), photometric="rgb",
+                     compression="jpeg", resolution=lvl_res, resolutionunit=tifffile.RESUNIT.CENTIMETER)
+            print(f"  wrote pyramid level (downsample {f}x): {accum.shape[:2]}", flush=True)
 
 
 def main(hires_path, transform_npz, output_dir, sample="sample", serial_number="", area="", checkpoint=False):
