@@ -1,0 +1,9 @@
+palom==2026.4.1
+dask==2026.8.0
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+scipy==1.15.3
+tifffile==2024.7.2
+zarr==2.18.3
+matplotlib==3.10.9
+loguru==0.7.3
