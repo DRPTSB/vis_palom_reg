@@ -50,7 +50,8 @@ register.py  -->  <sample>_transform.npz, _run_stats.json, _preview_warped_to_cy
      +--> report.py                     -->  <sample>_report.html + QC images
      +--> build_full_res_deliverables.py -->  <sample>_local_warp_only.ome.tif, _global_affine.json
               |
-              +--> merge_loupe_alignment.py --> <sample>_merged_alignment.json  (feed THIS to spaceranger,
+              +--> merge_loupe_alignment.py --> <serialNumber>-<area>-fiducials-image-registration.json
+                                                  (10x's own naming convention -- feed THIS to spaceranger,
                                                   not _global_affine.json alone -- see below)
 ```
 
@@ -138,7 +139,12 @@ python merge_loupe_alignment.py \
   --base-json SLIDE-AREA-fiducials-image-registration.json \
   --our-json SAMPLE_NAME_global_affine.json \
   --image SAMPLE_NAME_local_warp_only.ome.tif \
-  --output SAMPLE_NAME_merged_alignment.json
+  --output-dir .
+# writes ./SLIDE-AREA-fiducials-image-registration.json (serial/area taken
+# from --base-json) -- 10x's own naming convention for this file, so it
+# reads like any other Space Ranger alignment export. Pass --output to
+# override, or a different --output-dir so it can't collide with the
+# --base-json file it read from (refused if the two paths resolve equal).
 ```
 
 `SAMPLE_NAME_global_affine.json` alone crashes Space Ranger's
@@ -221,8 +227,9 @@ comfortably above 0.5.
 ## Space Ranger integration
 
 `--image` takes `<sample>_local_warp_only.ome.tif` in place of the original
-HiRes TIFF; `--loupe-alignment` takes `<sample>_merged_alignment.json`
-(from `merge_loupe_alignment.py` -- **not** the bare `_global_affine.json`,
+HiRes TIFF; `--loupe-alignment` takes the
+`<serialNumber>-<area>-fiducials-image-registration.json` that
+`merge_loupe_alignment.py` writes (**not** the bare `_global_affine.json`,
 which crashes `LOUPE_ALIGNMENT_READER`, see above) in place of Space
 Ranger's automatic registration. Everything else (`--cytaimage`,
 `--fastqs`, `--transcriptome`/`--probe-set`, `--slide`, `--area`) stays the

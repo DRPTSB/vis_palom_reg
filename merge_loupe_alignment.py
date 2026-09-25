@@ -37,12 +37,20 @@ the original raw HiRes TIFF), this script recomputes it against that file
 so it's consistent, in case Space Ranger (or Loupe) validates it -- cheap
 insurance, since we don't know for certain whether it's enforced.
 
+The output filename follows 10x's own naming convention for these files
+(`<serialNumber>-<area>-fiducials-image-registration.json`, matching what
+Space Ranger's automatic detection / Loupe's export already name it) --
+pass --output to override, but the default is deliberately the same name a
+real 10x-produced alignment file for this slide+area would have.
+
 Usage:
     python merge_loupe_alignment.py \\
       --base-json H1-RCH86GZ-D1-fiducials-image-registration.json \\
       --our-json NMR2_DRG_global_affine.json \\
       --image NMR2_DRG_local_warp_only.ome.tif \\
-      --output NMR2_DRG_merged_alignment.json
+      --output-dir .
+    # writes ./H1-RCH86GZ-D1-fiducials-image-registration.json (serial/area
+    # taken from the base file), overwriting nothing outside --output-dir
 """
 import argparse
 import hashlib
@@ -61,7 +69,14 @@ def md5_of_file(path, chunk_size=8 * 1024 * 1024):
     return h.hexdigest()
 
 
-def main(base_json, our_json, image_path, output_path):
+def default_output_name(serial_number, area):
+    """10x's own naming convention for these files, e.g.
+    'H1-RCH86GZ-D1-fiducials-image-registration.json' -- matches what Space
+    Ranger's auto-detection or a Loupe export would already call it."""
+    return f"{serial_number}-{area}-fiducials-image-registration.json"
+
+
+def main(base_json, our_json, image_path, output_path=None, output_dir="."):
     base = json.loads(Path(base_json).read_text())
     ours = json.loads(Path(our_json).read_text())
 
@@ -96,6 +111,16 @@ def main(base_json, our_json, image_path, output_path):
         "checksumHiRes": checksum,
         "transformImages": ours_m,
     }
+
+    if output_path is None:
+        output_path = Path(output_dir) / default_output_name(base["serialNumber"], base["area"])
+    output_path = Path(output_path)
+    if output_path.resolve() == Path(base_json).resolve():
+        raise SystemExit(
+            f"refusing to overwrite the base file itself ({base_json}) -- "
+            "pass a different --output-dir or --output"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(json.dumps(merged))
     print(f"wrote {output_path} (checksumHiRes={checksum})")
     print("all other keys (oligo, spot_metadata, metadata, slide_layout_file, spot_count, "
@@ -109,6 +134,9 @@ if __name__ == "__main__":
                     help="Space Ranger / Loupe's own complete alignment export for this slide+area")
     p.add_argument("--our-json", required=True, help="our cytAssistInfo-only *_global_affine.json")
     p.add_argument("--image", required=True, help="the corrected *_local_warp_only.ome.tif")
-    p.add_argument("--output", required=True)
+    p.add_argument("--output", default=None,
+                    help="explicit output path; default is 10x's own naming convention "
+                         "(<serialNumber>-<area>-fiducials-image-registration.json) under --output-dir")
+    p.add_argument("--output-dir", default=".", help="used only when --output is not given")
     args = p.parse_args()
-    main(args.base_json, args.our_json, args.image, args.output)
+    main(args.base_json, args.our_json, args.image, args.output, args.output_dir)
