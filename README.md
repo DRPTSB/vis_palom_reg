@@ -29,10 +29,12 @@ splits the result into the two pieces Space Ranger actually accepts:
    scale + translation) as a `cytAssistInfo.transformImages`-schema JSON,
    the same schema the slide's own auto-generated fiducial file uses.
 
-Feed both into `spaceranger count`: the image via `--image`, the JSON via
-`--loupe-alignment`. See "Space Ranger integration" below — **this requires
-a full rerun of `spaceranger count`**, there is no partial-alignment-only
-mode.
+This JSON on its own is **not** valid Space Ranger input — see
+`merge_loupe_alignment.py` below and "Space Ranger integration". Merge it
+into a complete alignment export for the same slide+area first, then feed
+the merged JSON via `--loupe-alignment` and the image via `--image`. See
+"Space Ranger integration" below — **this requires a full rerun of
+`spaceranger count`**, there is no partial-alignment-only mode.
 
 ## Install
 
@@ -47,6 +49,9 @@ register.py  -->  <sample>_transform.npz, _run_stats.json, _preview_warped_to_cy
      |
      +--> report.py                     -->  <sample>_report.html + QC images
      +--> build_full_res_deliverables.py -->  <sample>_local_warp_only.ome.tif, _global_affine.json
+              |
+              +--> merge_loupe_alignment.py --> <sample>_merged_alignment.json  (feed THIS to spaceranger,
+                                                  not _global_affine.json alone -- see below)
 ```
 
 ### 1. `register.py` — coarse + block-wise registration
@@ -126,6 +131,39 @@ downsample factor is *not* safe here: a 4x-downsample first level is ~1.5GB
 for an 80k x 98k image but ~2.6GB for a 90k x 156k image, which OOM-killed a
 ~3.8GB-RAM machine in practice.
 
+### 4. `merge_loupe_alignment.py` — required before feeding Space Ranger
+
+```bash
+python merge_loupe_alignment.py \
+  --base-json SLIDE-AREA-fiducials-image-registration.json \
+  --our-json SAMPLE_NAME_global_affine.json \
+  --image SAMPLE_NAME_local_warp_only.ome.tif \
+  --output SAMPLE_NAME_merged_alignment.json
+```
+
+`SAMPLE_NAME_global_affine.json` alone crashes Space Ranger's
+`LOUPE_ALIGNMENT_READER` stage with `KeyError: 'oligo'` (confirmed on a real
+spaceranger-4.1.0 run) -- that stage always expects the FULL combined
+alignment schema (`oligo`, `spot_metadata`, `metadata`, `slide_layout_file`,
+`spot_count`, `transform` [a separate spot/fiducial-grid matrix, distinct
+from `cytAssistInfo.transformImages`], `checksum`, `removeImagePages`), even
+when only the CytAssist-image-registration piece needs correcting. This
+script splices our `cytAssistInfo.transformImages` into a copy of the
+slide's own real alignment export -- Space Ranger's auto-detected one for
+that slide+area, or one exported from Loupe -- and recomputes
+`cytAssistInfo.checksumHiRes` (looks like an MD5, not confirmed whether
+Space Ranger enforces it, but cheap to keep consistent) against the new
+corrected image. Every other key is copied through unchanged.
+
+It also cross-checks our affine against the base file's own registration
+and warns if they disagree by more than 2% scale or 200px translation --
+useful when more than one candidate base file exists for a slide+area (seen
+in practice: two different exports for the same slide+area with
+substantially different `cytAssistInfo.transformImages` -- pick the one
+that agrees with your own independently-computed affine, not the most
+recently modified one; a later manual re-alignment attempt is not
+necessarily better than an earlier automatic one).
+
 ## Coordinate spaces
 
 - **`H0`** — native resolution, original orientation (the raw HiRes file).
@@ -183,8 +221,10 @@ comfortably above 0.5.
 ## Space Ranger integration
 
 `--image` takes `<sample>_local_warp_only.ome.tif` in place of the original
-HiRes TIFF; `--loupe-alignment` takes `<sample>_global_affine.json` in place
-of Space Ranger's automatic registration. Everything else (`--cytaimage`,
+HiRes TIFF; `--loupe-alignment` takes `<sample>_merged_alignment.json`
+(from `merge_loupe_alignment.py` -- **not** the bare `_global_affine.json`,
+which crashes `LOUPE_ALIGNMENT_READER`, see above) in place of Space
+Ranger's automatic registration. Everything else (`--cytaimage`,
 `--fastqs`, `--transcriptome`/`--probe-set`, `--slide`, `--area`) stays the
 same, under a fresh `--id`.
 
@@ -197,6 +237,5 @@ matrix in one pass, since spot calling depends on the image + alignment.
 
 `_global_affine.json` matches the schema of the CytAssist-to-microscope
 *image-registration* portion specifically (`cytAssistInfo.transformImages`),
-not a full fiducial/tissue-detection Loupe alignment — if Space Ranger's own
-fiducial detection on the CytAssist image was already fine, this should
-slot in as-is.
+not a full fiducial/tissue-detection Loupe alignment. It does **not** slot
+in as-is -- run it through `merge_loupe_alignment.py` first (see above).
