@@ -1,0 +1,26 @@
+name: vis-palom-reg
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - palom==2026.4.1
+      - dask==2026.8.0
+      - numpy==1.26.4
+      - opencv-python-headless==4.11.0.86
+      - scipy==1.15.3
+      - tifffile==2024.7.2
+      - zarr==2.18.3
+      - matplotlib==3.10.9
+      - loguru==0.7.3
+      - imagecodecs==2025.3.30  # needed for tifffile's compression="jpeg" pyramid writes
+
+      # --- optional: only needed for tissue_detection_pipeline.py's SAM path ---
+      # Not currently installed on the dev Mac this pipeline was built on --
+      # tissue_detection_pipeline.py always falls back to its morphological
+      # (HSV saturation + contour) tissue detection without them, which is
+      # what every sample run this project has used so far. Uncomment only
+      # if SAM-based segmentation is actually needed.
+      # - torch
+      # - segment-anything
