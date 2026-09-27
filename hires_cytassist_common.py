@@ -1,4 +1,7 @@
 """Shared IO helpers for the HiRes<->CytAssist registration pipeline."""
+import datetime
+import os
+import sys
 from pathlib import Path
 
 import cv2
@@ -65,3 +68,63 @@ def downsample_to_physical_scale(path, target_um_per_px):
     resized = cv2.resize(strided, (target_w, target_h), interpolation=cv2.INTER_AREA)
     print(f"  level {best_level} ({base.shape[0]}x{base.shape[1]}) -> final {resized.shape[:2]}")
     return resized
+
+
+
+class _Tee:
+    """Duplicates writes to both an underlying stream and a shared log
+    file, so console output is captured to a persistent per-sample log
+    without changing any individual print()/logger call. Wrapping
+    sys.stdout/sys.stderr with this (see setup_pipeline_log below) means a
+    crash's traceback, a warning emitted by a third-party library (palom,
+    tifffile, dask), and every existing print()/logger.info() call all end
+    up in the log -- not just messages this codebase explicitly writes to
+    it."""
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log_file = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log_file.write(data)
+        self._log_file.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._log_file.flush()
+
+    def isatty(self):
+        return False
+
+
+def setup_pipeline_log(log_dir, sample, script_name):
+    """Append this process's entire stdout/stderr -- every print(),
+    logger call, warning, and crash traceback -- to a single, persistent
+    <log_dir>/<sample>_pipeline.log, shared across every stage of the
+    pipeline (register.py, tissue_detection_pipeline.py,
+    build_full_res_deliverables.py, merge_loupe_alignment.py, report.py,
+    run_pipeline.py). Call this once, as early as possible, at the very
+    start of each script's entry point (before other top-level code that
+    might itself configure logging -- see tissue_detection_pipeline.py,
+    which moves its logging.basicConfig() call to after this one so its
+    handler binds to the already-wrapped stderr).
+
+    Why this exists: build_full_res_deliverables.py's --checkpoint runs
+    typically span many separate process invocations (one per device-shell
+    call, each capped at ~180s on this project's remote-device bridge), so
+    console output from any one invocation was otherwise lost the moment
+    that shell call ended -- including, in one real 2026-09-27 incident, a
+    crash traceback that would have made a checkpoint-corruption bug much
+    faster to diagnose. Appending to one shared file instead means the
+    full history of a sample's run survives past any single invocation.
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{sample}_pipeline.log"
+    log_file = open(log_path, "a", buffering=1)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_file.write(f"\n=== {ts} -- {script_name} started (pid {os.getpid()}) ===\n")
+    log_file.flush()
+    sys.stdout = _Tee(sys.stdout, log_file)
+    sys.stderr = _Tee(sys.stderr, log_file)
+    return log_path

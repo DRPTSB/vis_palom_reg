@@ -4,6 +4,7 @@ Tissue detection for Visium alignment pipeline.
 Uses SAM for zero-shot tissue segmentation, with morphological fallback.
 Optional SAM installation - morphological approximations work without it.
 """
+import sys
 import cv2
 import numpy as np
 from pathlib import Path
@@ -12,7 +13,9 @@ import json
 import logging
 from typing import Tuple, List
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hires_cytassist_common import setup_pipeline_log
+
 logger = logging.getLogger(__name__)
 
 def find_tissue_seed_points(image: np.ndarray,
@@ -176,7 +179,17 @@ def main():
     parser.add_argument("--min-mask-area", type=int, default=100, help="Min mask area")
     parser.add_argument("--no-clean", action="store_true", help="Skip mask cleaning")
     parser.add_argument("--force-morphological", action="store_true", help="Use morphological only")
+    parser.add_argument("--log-dir", default=None,
+                         help="where <sample>_pipeline.log lives; default: --output-dir. Set "
+                              "explicitly since this stage's own --output-dir is normally a "
+                              "tissue_detection/ subfolder, not the shared per-sample "
+                              "directory (run_pipeline.py always sets this).")
     args = parser.parse_args()
+
+    setup_pipeline_log(args.log_dir or args.output_dir, args.sample, "tissue_detection_pipeline.py")
+    # Moved here (after setup_pipeline_log) so this handler binds to the
+    # already-wrapped stderr and its output reaches the shared log too.
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     logger.info(f"=== Tissue Detection ===")
     logger.info(f"Sample: {args.sample}, Image: {args.cytassist_image}")

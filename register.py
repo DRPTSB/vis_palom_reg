@@ -53,7 +53,7 @@ import numpy as np
 import tifffile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hires_cytassist_common import downsample_to_physical_scale, um_per_pixel
+from hires_cytassist_common import downsample_to_physical_scale, um_per_pixel, setup_pipeline_log
 
 
 def load_cytassist_rgb(path):
@@ -629,7 +629,12 @@ if __name__ == "__main__":
                          "low-texture tissue. 0 disables it. Default 10.0.")
     p.add_argument("--rotation-search-step", type=float, default=0.5,
                     help="rotation search angle step in degrees. Default 0.5.")
+    p.add_argument("--log-dir", default=None,
+                    help="where <sample>_pipeline.log lives; default: --output-dir. Set "
+                         "explicitly when a stage's own --output-dir isn't the shared "
+                         "per-sample directory (run_pipeline.py always sets this).")
     args = p.parse_args()
+    setup_pipeline_log(args.log_dir or args.output_dir, args.sample, "register.py")
     if args.source_dir:
         sys.path.insert(0, args.source_dir)
     main(args.hires, args.cytassist, args.output_dir, sample=args.sample,

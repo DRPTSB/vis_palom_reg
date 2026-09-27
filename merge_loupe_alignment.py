@@ -77,6 +77,7 @@ from pathlib import Path
 import cv2
 
 import oligo_tissue
+from hires_cytassist_common import setup_pipeline_log
 
 
 def md5_of_file(path, chunk_size=8 * 1024 * 1024):
@@ -191,7 +192,21 @@ if __name__ == "__main__":
                     help="explicit output path; default is 10x's own naming convention "
                          "(<serialNumber>-<area>-fiducials-image-registration.json) under --output-dir")
     p.add_argument("--output-dir", default=".", help="used only when --output is not given")
+    p.add_argument("--sample", default=None,
+                    help="sample name, for logging only (matches the other stages' own "
+                         "--sample so they share one <sample>_pipeline.log). Default: derived "
+                         "from the base JSON's serialNumber-area, for standalone use.")
+    p.add_argument("--log-dir", default=None,
+                    help="where <sample>_pipeline.log lives; default: --output-dir. Set "
+                         "explicitly since this stage's own --output-dir is normally a "
+                         "spaceranger_alignment/ subfolder, not the shared per-sample "
+                         "directory (run_pipeline.py always sets this).")
     args = p.parse_args()
+    _log_sample = args.sample
+    if _log_sample is None:
+        _base_for_log = json.loads(Path(args.base_json).read_text())
+        _log_sample = f"{_base_for_log.get('serialNumber', 'unknown')}-{_base_for_log.get('area', 'unknown')}"
+    setup_pipeline_log(args.log_dir or args.output_dir, _log_sample, "merge_loupe_alignment.py")
     main(args.base_json, args.our_json, args.image, args.output, args.output_dir,
          tissue_mask_path=args.tissue_mask, tissue_aggregation=args.tissue_aggregation,
          tissue_supersample=args.tissue_supersample)

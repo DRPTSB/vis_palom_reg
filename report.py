@@ -31,7 +31,7 @@ import tifffile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_full_res_deliverables import fit_local_correction, global_affine, get_block_matrix
-from hires_cytassist_common import read_series0_pyramid
+from hires_cytassist_common import read_series0_pyramid, setup_pipeline_log
 
 
 # ---------------------------------------------------------------- overlay --
@@ -444,5 +444,8 @@ if __name__ == "__main__":
                     help="max long-side pixels for the whole-region overlay JPEG")
     p.add_argument("--before-after-cap", type=int, default=3000,
                     help="max long-side pixels (per panel) for the before/after comparison JPEG")
+    p.add_argument("--log-dir", default=None,
+                    help="where <sample>_pipeline.log lives; default: --output-dir.")
     args = p.parse_args()
+    setup_pipeline_log(args.log_dir or args.output_dir, args.sample, "report.py")
     main(args.sample, args.output_dir, args.hires, args.cytassist, args.cap_long_side, args.before_after_cap)

@@ -51,7 +51,7 @@ import tifffile
 import zarr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hires_cytassist_common import read_series0_pyramid, um_per_pixel
+from hires_cytassist_common import read_series0_pyramid, um_per_pixel, setup_pipeline_log
 
 WRITE_TILE = 512
 HALO = 512          # margin around each band/chunk, must exceed the largest local correction
@@ -293,6 +293,9 @@ if __name__ == "__main__":
     p.add_argument("--checkpoint", action="store_true",
                     help="cache progress to disk so an interrupted run can resume "
                          "(useful on RAM- or time-constrained machines)")
+    p.add_argument("--log-dir", default=None,
+                    help="where <sample>_pipeline.log lives; default: --output-dir.")
     args = p.parse_args()
+    setup_pipeline_log(args.log_dir or args.output_dir, args.sample, "build_full_res_deliverables.py")
     main(args.hires, args.transform_npz, args.output_dir, sample=args.sample,
          serial_number=args.serial_number, area=args.area, checkpoint=args.checkpoint)

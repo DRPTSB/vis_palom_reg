@@ -43,6 +43,7 @@ import sys
 from pathlib import Path
 
 import oligo_tissue
+from hires_cytassist_common import setup_pipeline_log
 
 HERE = Path(__file__).resolve().parent
 
@@ -110,6 +111,12 @@ def main():
     tissue_dir = output_dir / "tissue_detection"
     alignment_dir = output_dir / "spaceranger_alignment"
 
+    # Every stage below is passed --log-dir pointing at this same output_dir,
+    # so all 6 scripts (this one included) append to one shared
+    # <sample>_pipeline.log, regardless of which one's own --output-dir is a
+    # subfolder (tissue_dir, alignment_dir). See hires_cytassist_common.py.
+    setup_pipeline_log(output_dir, args.sample, "run_pipeline.py")
+
     hires = require_file(args.hires, "HiRes image")
     cytassist = require_file(args.cytassist, "CytAssist image")
     base_json_path = require_file(args.base_json, "base alignment JSON")
@@ -136,6 +143,7 @@ def main():
         "--rotation-search-deg", str(args.rotation_search_deg),
         "--rotation-search-step", str(args.rotation_search_step),
     ]
+    register_cmd += ["--log-dir", str(output_dir)]
     if args.extra_mirror_x:
         register_cmd.append("--extra-mirror-x")
     if args.manual_translation is not None:
@@ -151,6 +159,7 @@ def main():
         "--saturation-threshold", str(args.tissue_saturation_threshold),
         "--min-blob-area", str(args.tissue_min_blob_area),
         "--min-mask-area", str(args.tissue_min_mask_area),
+        "--log-dir", str(output_dir),
     ]
     if args.force_morphological_tissue:
         tissue_cmd.append("--force-morphological")
@@ -163,6 +172,7 @@ def main():
         "--hires", str(hires), "--transform-npz", str(transform_npz),
         "--output-dir", str(output_dir), "--sample", args.sample,
         "--serial-number", args.serial_number, "--area", args.area,
+        "--log-dir", str(output_dir),
     ]
     if args.checkpoint:
         build_cmd.append("--checkpoint")
@@ -178,6 +188,7 @@ def main():
         "--tissue-aggregation", args.tissue_aggregation,
         "--tissue-supersample", str(args.tissue_supersample),
         "--output-dir", str(alignment_dir),
+        "--sample", args.sample, "--log-dir", str(output_dir),
     ]
     run_step("merge_loupe_alignment.py", merge_cmd)
     final_json = require_file(
@@ -188,7 +199,8 @@ def main():
     qc_report = None
     if not args.skip_report:
         report_cmd = [sys.executable, "report.py", "--sample", args.sample,
-                       "--output-dir", str(output_dir), "--hires", str(hires)]
+                       "--output-dir", str(output_dir), "--hires", str(hires),
+                       "--log-dir", str(output_dir)]
         run_step("report.py", report_cmd)
         qc_report = require_file(output_dir / f"{args.sample}_report.html", "QC HTML report")
 
