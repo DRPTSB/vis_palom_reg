@@ -301,7 +301,16 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
     print(f"Coarse affine: scale=({scale_x:.4f},{scale_y:.4f}) angle={angle:.2f} deg "
           "-- scale should be close to 1.0")
 
-    angle_implausible = abs(angle) > 15.0
+    # A valid ORB fit can legitimately land near ANY multiple of 90 degrees, not just
+    # near 0: match_test_flip_rotate's own orientation search doesn't always fully
+    # resolve a 90-degree ambiguity, and ORB can validly refine on top of that with an
+    # extra ~90/180/270 degrees. Bug found 2026-09-27: flagging any |angle| > 15 as
+    # implausible wrongly overrode a real, spaceranger-verified-correct fit on NMR2_DRG
+    # (angle=90.67, exactly reproducing the archived good transform.npz) with a worse
+    # fallback fit. Check distance to the NEAREST multiple of 90 instead.
+    angle_residual = angle % 90.0
+    angle_residual = min(angle_residual, 90.0 - angle_residual)
+    angle_implausible = angle_residual > 15.0
     if manual_translation is None and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol
                                         or angle_implausible):
         reason = "scale far from 1.0" if not angle_implausible else "implausible rotation angle"
