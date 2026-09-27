@@ -288,6 +288,30 @@ def refine_rotation_and_translation_near_seed(ref_thumb, moving_thumb, seed_dx, 
     return rot_2x3, best_angle, best_score, per_angle_scores, dx, dy
 
 
+def scale_angle_plausible(m, scale_tol):
+    """Shared plausibility check for a coarse affine matrix, used both to
+    decide whether to retry/fall back and to report the final result.
+    Kept as ONE function (not duplicated inline in two places) after a real
+    bug (2026-09-27, commit 9d6ec04) where two separate copies of this same
+    check drifted apart and silently disagreed.
+
+    A valid ORB fit can legitimately land near ANY multiple of 90 degrees,
+    not just near 0 (match_test_flip_rotate's own orientation search doesn't
+    always fully resolve a 90-degree ambiguity, and ORB can validly refine
+    on top of that with an extra ~90/180/270 degrees) -- so this checks
+    distance to the NEAREST multiple of 90, not distance to 0.
+
+    Returns (plausible, scale_x, scale_y, angle_deg).
+    """
+    scale_x, scale_y = np.hypot(m[0, 0], m[1, 0]), np.hypot(m[0, 1], m[1, 1])
+    angle = np.degrees(np.arctan2(m[1, 0], m[0, 0]))
+    angle_residual = angle % 90.0
+    angle_residual = min(angle_residual, 90.0 - angle_residual)
+    plausible = (abs(scale_x - 1) <= scale_tol and abs(scale_y - 1) <= scale_tol
+                 and angle_residual <= 15.0)
+    return plausible, scale_x, scale_y, angle
+
+
 def override_tissue_free_blocks(matrices_np, raw_valid, grid_shape, coarse_matrix):
     """Blocks with no raw local-refinement signal (typically tissue-free
     background) are, by default, filled in by palom's constrain_shifts()
@@ -435,27 +459,43 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
         aligner.coarse_affine_matrix = np.vstack([refined_matrix, [0, 0, 1]])
         used_phase_fallback = False
     else:
-        aligner.coarse_register_affine(n_keypoints=n_keypoints)
+        # ORB+RANSAC found (2026-09-27, NMR2_Colon) to be genuinely
+        # non-deterministic run-to-run on the SAME images with the SAME
+        # code: one run cleanly found angle=-91.20deg with no warnings, the
+        # very next run on identical inputs got an implausible scale,
+        # triggered the correlation-search fallback, and landed on an
+        # ambiguous, wrong optimum (own diagnostic: "top two correlation
+        # peaks within 0.05") -- silently, if not for a visual QC check of
+        # the resulting warp-quiver plot. Since a plausible fit IS
+        # consistently achievable on these same inputs, retry the SAME
+        # reliable method a few times (a fresh ORB/RANSAC draw each time)
+        # before reaching for the correlation-search fallback, which is
+        # known to be less reliable on repetitive/self-similar tissue.
+        max_orb_attempts = 5
+        for attempt in range(1, max_orb_attempts + 1):
+            aligner.coarse_register_affine(n_keypoints=n_keypoints)
+            plausible, _, _, _ = scale_angle_plausible(aligner.affine_matrix, scale_tol)
+            if plausible:
+                if attempt > 1:
+                    msg = (f"ORB coarse fit looked implausible on attempt(s) 1-{attempt - 1} "
+                           f"(non-deterministic RANSAC draw) but attempt {attempt} looks "
+                           "plausible -- using it.")
+                    print(f"NOTE: {msg}")
+                    warnings.append(msg)
+                break
+        else:
+            print(f"ORB coarse fit looked implausible on all {max_orb_attempts} attempts "
+                  "-- falling back to the correlation search below.")
         used_phase_fallback = False
 
     m = aligner.affine_matrix
-    scale_x, scale_y = np.hypot(m[0, 0], m[1, 0]), np.hypot(m[0, 1], m[1, 1])
-    angle = np.degrees(np.arctan2(m[1, 0], m[0, 0]))
+    scale_x, scale_y, angle = scale_angle_plausible(m, scale_tol)[1:]
     print(f"Coarse affine: scale=({scale_x:.4f},{scale_y:.4f}) angle={angle:.2f} deg "
           "-- scale should be close to 1.0")
 
-    # A valid ORB fit can legitimately land near ANY multiple of 90 degrees, not just
-    # near 0: match_test_flip_rotate's own orientation search doesn't always fully
-    # resolve a 90-degree ambiguity, and ORB can validly refine on top of that with an
-    # extra ~90/180/270 degrees. Bug found 2026-09-27: flagging any |angle| > 15 as
-    # implausible wrongly overrode a real, spaceranger-verified-correct fit on NMR2_DRG
-    # (angle=90.67, exactly reproducing the archived good transform.npz) with a worse
-    # fallback fit. Check distance to the NEAREST multiple of 90 instead.
-    angle_residual = angle % 90.0
-    angle_residual = min(angle_residual, 90.0 - angle_residual)
-    angle_implausible = angle_residual > 15.0
-    if manual_translation is None and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol
-                                        or angle_implausible):
+    plausible, _, _, _ = scale_angle_plausible(m, scale_tol)
+    angle_implausible = not plausible and not (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol)
+    if manual_translation is None and not plausible:
         reason = "scale far from 1.0" if not angle_implausible else "implausible rotation angle"
         if angle_implausible and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol):
             reason = "scale far from 1.0 and implausible rotation angle"
