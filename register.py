@@ -553,7 +553,32 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
     print("grid_shape:", aligner.ref_img.numblocks)
     aligner.compute_shifts()
     raw_valid = np.isfinite(np.linalg.norm(aligner.shifts, axis=1))
-    print(f"Blocks with valid local signal: {raw_valid.sum()}/{len(aligner.shifts)}")
+    raw_valid_frac = raw_valid.mean()
+    print(f"Blocks with valid local signal: {raw_valid.sum()}/{len(aligner.shifts)} "
+          f"({raw_valid_frac:.1%})")
+    # Found 2026-09-27 (NMR3_DRG): palom's own match_test_flip_rotate (which
+    # resolves the flip/rotation ambiguity BEFORE any of this script's own
+    # logic runs) is itself non-deterministic run-to-run on identical
+    # inputs -- one run picked one orientation (score grid had two
+    # candidates within 1 point of the winner, an easy tie to flip on
+    # keypoint-matching noise), a later run on the same images picked a
+    # 90-degree-different one instead. A wrong orientation leaves almost no
+    # real per-block local signal (12/600 valid blocks was the real case),
+    # while overall pyramid `coverage` still reports 1.0 (it only measures
+    # where the coarse-only warp places pixels, not whether the local
+    # match actually found anything) and no other check catches it. This
+    # is the cheapest, most general signal available: whatever the actual
+    # cause (wrong orientation, wrong coarse fit, wrong manual seed), if
+    # nearly all blocks fail to find local signal, something upstream is
+    # wrong and the run should not be trusted without inspection.
+    if raw_valid_frac < 0.2:
+        msg = (f"only {raw_valid.sum()}/{len(aligner.shifts)} ({raw_valid_frac:.1%}) blocks "
+               "found valid local signal -- this is far too low for a correct registration "
+               "and strongly suggests the coarse alignment (or the upstream flip/rotation "
+               "choice) is wrong, even though coverage may still look fine. Do not trust this "
+               "run without inspecting the QC report/warp-quiver plot.")
+        print(f"WARNING: {msg}")
+        warnings.append(msg)
     if np.prod(aligner.grid_shape) >= 4:
         try:
             aligner.constrain_shifts()
