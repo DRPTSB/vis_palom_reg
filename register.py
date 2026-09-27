@@ -119,6 +119,75 @@ def phase_correlation_affine(ref_thumb, moving_thumb, n_peaks=5, peak_excl=100):
     return affine_matrix, peaks
 
 
+def search_rotation_translation_affine(ref_thumb, moving_thumb, angle_range=(-10, 10),
+                                        angle_step=0.5, n_peaks=3, peak_excl=50):
+    """Combined rotation+translation coarse-fit fallback, more robust than
+    ORB+RANSAC on repetitive/self-similar tissue (colon rings, scattered DRG
+    explants, etc. -- see project notes finding 6). For each candidate angle,
+    rotates moving_thumb about its center, then finds the best-correlating
+    TRANSLATION against ref_thumb via a real sliding-window search
+    (cv2.matchTemplate, same "smaller image is the template" convention as
+    phase_correlation_affine below) rather than assuming zero translation --
+    a plain top-left-crop correlation at each angle is meaningless before any
+    translation is known and gives noise-level scores on real data.
+
+    Returns (affine_2x3, best_angle_deg, best_score, per_angle_scores) all in
+    THUMBNAIL-scale units (same convention as coarse_register_affine's own
+    output -- aligner.affine_matrix rescales automatically).
+    """
+    import cv2
+
+    ref_sig = (255.0 - ref_thumb).astype("float32")
+    h, w = moving_thumb.shape[:2]
+    center = (w / 2.0, h / 2.0)
+
+    best = None  # (score, angle, dx, dy, peaks)
+    per_angle_scores = []
+    angles = np.arange(angle_range[0], angle_range[1] + angle_step, angle_step)
+    for angle in angles:
+        rot_2x3 = cv2.getRotationMatrix2D(center, float(angle), 1.0)
+        rotated = cv2.warpAffine(moving_thumb, rot_2x3, (w, h))
+        mov_sig = (255.0 - rotated).astype("float32")
+
+        ref_fits = ref_sig.shape[0] <= mov_sig.shape[0] and ref_sig.shape[1] <= mov_sig.shape[1]
+        mov_fits = mov_sig.shape[0] <= ref_sig.shape[0] and mov_sig.shape[1] <= ref_sig.shape[1]
+        if ref_fits:
+            template, search, template_is_ref = ref_sig, mov_sig, True
+        elif mov_fits:
+            template, search, template_is_ref = mov_sig, ref_sig, False
+        else:
+            hh, ww = min(ref_sig.shape[0], mov_sig.shape[0]), min(ref_sig.shape[1], mov_sig.shape[1])
+            template, search, template_is_ref = ref_sig[:hh, :ww], mov_sig[:hh, :ww], True
+
+        scores = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+        peaks = []
+        remaining = scores.copy()
+        for _ in range(n_peaks):
+            _, score, _, (x, y) = cv2.minMaxLoc(remaining)
+            peaks.append((float(score), int(y), int(x)))
+            remaining[max(0, y - peak_excl):y + peak_excl, max(0, x - peak_excl):x + peak_excl] = -2
+
+        top_score, top_y, top_x = peaks[0]
+        if template_is_ref:
+            dx, dy = -top_x, -top_y
+        else:
+            dx, dy = top_x, top_y
+
+        per_angle_scores.append((float(angle), top_score))
+        if best is None or top_score > best[0]:
+            best = (top_score, float(angle), float(dx), float(dy), peaks)
+
+    best_score, best_angle, dx, dy, best_peaks = best
+    rot_2x3 = cv2.getRotationMatrix2D(center, best_angle, 1.0)
+    # Translate AFTER rotate (dx,dy found on the already-rotated thumbnail) --
+    # for an affine applied as M @ [x,y,1], adding to the translation column
+    # is correct since it's the last transform applied.
+    rot_2x3 = rot_2x3.copy()
+    rot_2x3[0, 2] += dx
+    rot_2x3[1, 2] += dy
+    return rot_2x3, best_angle, best_score, per_angle_scores, best_peaks
+
+
 def override_tissue_free_blocks(matrices_np, raw_valid, grid_shape, coarse_matrix):
     """Blocks with no raw local-refinement signal (typically tissue-free
     background) are, by default, filled in by palom's constrain_shifts()
@@ -141,7 +210,8 @@ def override_tissue_free_blocks(matrices_np, raw_valid, grid_shape, coarse_matri
 
 def main(hires_path, cytassist_path, output_dir, sample="sample",
          block_step=128, block_size=None, n_keypoints=12000, thumbnail_level=2,
-         scale_tol=0.15, extra_mirror_x=False, manual_translation=None):
+         scale_tol=0.15, extra_mirror_x=False, manual_translation=None,
+         rotation_search_deg=10.0, rotation_search_step=0.5):
     import palom  # only needed here; keep it optional at import time for common.py users
     import palom.register_util as register_util
 
@@ -190,6 +260,7 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
         hires_gray = hires_gray[:, ::-1].copy()
         hires_rgb = hires_rgb[:, ::-1, :].copy()
 
+    rotation_correction_deg = None
     chunk = (block_step, block_step)
     hires_gray_da = da.from_array(hires_gray, chunks=chunk)
     cyt_gray_da = da.from_array(cyt_gray, chunks=chunk)
@@ -230,18 +301,40 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
     print(f"Coarse affine: scale=({scale_x:.4f},{scale_y:.4f}) angle={angle:.2f} deg "
           "-- scale should be close to 1.0")
 
-    if manual_translation is None and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol):
-        msg = ("coarse scale is far from 1.0 -- ORB-based fit likely failed (common on "
-               "repetitive/self-similar tissue). Falling back to phase-cross-correlation "
-               "translation estimate...")
+    angle_implausible = abs(angle) > 15.0
+    if manual_translation is None and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol
+                                        or angle_implausible):
+        reason = "scale far from 1.0" if not angle_implausible else "implausible rotation angle"
+        if angle_implausible and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol):
+            reason = "scale far from 1.0 and implausible rotation angle"
+        msg = (f"coarse ORB-based fit looks wrong ({reason}) -- likely failed (common on "
+               "repetitive/self-similar tissue). Falling back to a rotation-aware "
+               f"correlation search (+/-{rotation_search_deg:.1f} deg)...")
         print(f"WARNING: {msg}")
         warnings.append(msg)
         try:
-            fallback_matrix, peaks = phase_correlation_affine(ref_thumbnail, moving_thumbnail)
-            print("Top correlation peaks (score, y, x) at thumbnail scale -- check these "
-                  "aren't near-tied (a sign of repetitive-tissue ambiguity):")
+            fallback_matrix, best_angle, best_score, per_angle_scores, peaks = (
+                search_rotation_translation_affine(
+                    ref_thumbnail, moving_thumbnail,
+                    angle_range=(-rotation_search_deg, rotation_search_deg),
+                    angle_step=rotation_search_step,
+                )
+            )
+            rotation_correction_deg = best_angle
+            print(f"Rotation+translation search: best_angle={best_angle:+.2f} deg "
+                  f"(score={best_score:.4f})")
+            print("Top correlation peaks at the winning angle (score, y, x) at thumbnail "
+                  "scale -- check these aren't near-tied (a sign of repetitive-tissue "
+                  "ambiguity):")
             for score, py, px in peaks:
                 print(f"    {score:.4f}  y={py} x={px}")
+            if abs(best_angle) >= (rotation_search_deg - rotation_search_step):
+                msg = (f"winning angle ({best_angle:+.1f} deg) is at the edge of the searched "
+                       f"+/-{rotation_search_deg:.1f} deg range -- the true angle may lie "
+                       "outside it; widen --rotation-search-deg and re-run if the QC report "
+                       "looks wrong.")
+                print(f"WARNING: {msg}")
+                warnings.append(msg)
             # fallback_matrix's translation is thumbnail-scale (same convention
             # as coarse_register_affine's own output) -- don't rescale by
             # `factor` here, aligner.affine_matrix does that automatically.
@@ -249,7 +342,7 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
             m = aligner.affine_matrix
             scale_x, scale_y = np.hypot(m[0, 0], m[1, 0]), np.hypot(m[0, 1], m[1, 1])
             angle = np.degrees(np.arctan2(m[1, 0], m[0, 0]))
-            print(f"Correlation-search fallback affine: scale=({scale_x:.4f},{scale_y:.4f}) "
+            print(f"Rotation-aware fallback affine: scale=({scale_x:.4f},{scale_y:.4f}) "
                   f"angle={angle:.2f} deg, translation=({m[0,2]:.1f},{m[1,2]:.1f})")
             if len(peaks) > 1 and peaks[0][0] - peaks[1][0] < 0.05:
                 msg = ("top two correlation peaks are within 0.05 of each other -- this "
@@ -304,6 +397,7 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
         orientation_matrix=orientation_matrix,
         used_phase_fallback=used_phase_fallback,
         n_blocks_overridden=n_overridden,
+        rotation_search_correction_deg=np.nan if rotation_correction_deg is None else rotation_correction_deg,
     )
     print(f"Wrote {npz_path}")
 
@@ -333,6 +427,7 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
         "manual_translation": list(manual_translation) if manual_translation else None,
         "used_phase_fallback": used_phase_fallback,
         "coarse_scale": [float(scale_x), float(scale_y)], "coarse_angle_deg": float(angle),
+        "rotation_search_correction_deg": rotation_correction_deg,
         "coarse_translation": [float(m[0, 2]), float(m[1, 2])],
         "grid_shape": [int(gr), int(gc)],
         "n_blocks_total": int(gr * gc), "n_blocks_valid_raw": int(raw_valid.sum()),
@@ -365,6 +460,12 @@ if __name__ == "__main__":
                          "coarse affine directly (full/CytAssist-scale pixel units, applied AFTER "
                          "--extra-mirror-x if both are given). For samples where automatic coarse "
                          "registration can't be trusted (e.g. repetitive tissue + limited FOV overlap).")
+    p.add_argument("--rotation-search-deg", type=float, default=10.0,
+                    help="explicit small-angle rotation search range in degrees (+/-), applied before the "
+                         "ORB coarse fit to catch residual rotations ORB under-detects on repetitive/"
+                         "low-texture tissue. 0 disables it. Default 10.0.")
+    p.add_argument("--rotation-search-step", type=float, default=0.5,
+                    help="rotation search angle step in degrees. Default 0.5.")
     args = p.parse_args()
     if args.source_dir:
         sys.path.insert(0, args.source_dir)
@@ -372,4 +473,5 @@ if __name__ == "__main__":
          block_step=args.block_step, block_size=args.block_size,
          n_keypoints=args.n_keypoints, thumbnail_level=args.thumbnail_level,
          scale_tol=args.scale_tol, extra_mirror_x=args.extra_mirror_x,
-         manual_translation=tuple(args.manual_translation) if args.manual_translation else None)
+         manual_translation=tuple(args.manual_translation) if args.manual_translation else None,
+         rotation_search_deg=args.rotation_search_deg, rotation_search_step=args.rotation_search_step)
