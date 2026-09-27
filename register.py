@@ -19,9 +19,15 @@ Pipeline, in order:
    orientation (it only tests half of the 16 possible flip x rotation
    combinations -- see the docstring on that flag below).
 4. Fit a coarse affine: normally palom's ORB+RANSAC feature match
-   (coarse_register_affine); optionally seeded manually (--manual-translation)
-   or, if the ORB fit's scale is implausible, a translation-only whole-image
-   template-matching fallback (phase_correlation_affine below).
+   (coarse_register_affine); or, if the ORB fit's scale/angle looks
+   implausible, a rotation-aware whole-image template-matching fallback
+   (search_rotation_translation_affine); or, when the automatic fit can't be
+   trusted at all (e.g. repetitive tissue + limited FOV overlap), a full
+   affine (rotation + translation) refined near a manually-supplied seed
+   translation (--manual-translation, see
+   refine_rotation_and_translation_near_seed) -- never a bare identity-
+   rotation assumption, which was found to silently miss a real ~0.5deg
+   rotation on NMR3_DRG (2026-09-27).
 5. Fit a per-block local refinement (palom's compute_shifts /
    constrain_shifts), with one safety net: blocks that have no raw local
    signal (typically tissue-free background) are NOT trusted to
@@ -188,6 +194,100 @@ def search_rotation_translation_affine(ref_thumb, moving_thumb, angle_range=(-10
     return rot_2x3, best_angle, best_score, per_angle_scores, best_peaks
 
 
+def refine_rotation_and_translation_near_seed(ref_thumb, moving_thumb, seed_dx, seed_dy,
+                                               angle_range=(-10, 10), angle_step=0.5,
+                                               search_margin=40.0):
+    """Full affine (rotation + translation) refinement seeded by an already-
+    known-good translation (e.g. --manual-translation), for samples where an
+    open-ended rotation+translation search (search_rotation_translation_affine
+    above) converges to a wrong, far-away local optimum on repetitive/
+    self-similar tissue -- which is exactly why a manual seed was needed in
+    the first place. Unlike that function, the translation search here is
+    restricted to a small window (+/- search_margin px, THUMBNAIL-scale)
+    around the known-good seed, at every candidate angle, so it can refine
+    rotation and make a small translation correction without ever being able
+    to jump back to that wrong distant optimum.
+
+    seed_dx, seed_dy: THUMBNAIL-scale, same sign convention as
+    phase_correlation_affine's/search_rotation_translation_affine's own
+    output (i.e. what you'd pass straight into the coarse-affine translation
+    column after dividing the full-scale manual translation by the
+    thumbnail downsample factor).
+
+    Returns (affine_2x3, best_angle_deg, best_score, per_angle_scores,
+    refined_dx, refined_dy) -- all thumbnail-scale, same convention as
+    search_rotation_translation_affine.
+    """
+    import cv2
+
+    ref_sig = (255.0 - ref_thumb).astype("float32")
+    h, w = moving_thumb.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    # moving's own canvas shape is unchanged by warpAffine's rotation, so
+    # which image is the "template" vs. the "search" area doesn't depend on
+    # angle -- resolve it once, matching the other two functions' convention.
+    ref_fits_in_moving = ref_sig.shape[0] <= h and ref_sig.shape[1] <= w
+
+    best = None  # (score, angle, dx, dy)
+    per_angle_scores = []
+    angles = np.arange(angle_range[0], angle_range[1] + angle_step, angle_step)
+    for angle in angles:
+        rot_2x3 = cv2.getRotationMatrix2D(center, float(angle), 1.0)
+        rotated = cv2.warpAffine(moving_thumb, rot_2x3, (w, h))
+        mov_sig = (255.0 - rotated).astype("float32")
+
+        if ref_fits_in_moving:
+            template, search, template_is_ref = ref_sig, mov_sig, True
+        elif mov_sig.shape[0] <= ref_sig.shape[0] and mov_sig.shape[1] <= ref_sig.shape[1]:
+            template, search, template_is_ref = mov_sig, ref_sig, False
+        else:
+            hh, ww = min(ref_sig.shape[0], mov_sig.shape[0]), min(ref_sig.shape[1], mov_sig.shape[1])
+            template, search, template_is_ref = ref_sig[:hh, :ww], mov_sig[:hh, :ww], True
+
+        th, tw = template.shape[:2]
+        sh, sw = search.shape[:2]
+        # Expected top-left placement of `template` within `search`, per the
+        # seed translation and this module's sign convention.
+        if template_is_ref:
+            exp_x, exp_y = -seed_dx, -seed_dy
+        else:
+            exp_x, exp_y = seed_dx, seed_dy
+
+        x0 = int(np.clip(np.floor(exp_x - search_margin), 0, max(sw - 1, 0)))
+        y0 = int(np.clip(np.floor(exp_y - search_margin), 0, max(sh - 1, 0)))
+        x1 = int(np.clip(np.ceil(exp_x + tw + search_margin), x0 + 1, sw))
+        y1 = int(np.clip(np.ceil(exp_y + th + search_margin), y0 + 1, sh))
+        if (y1 - y0) < th or (x1 - x0) < tw:
+            # Seed placed the template too close to search's edge for the
+            # crop to fully contain it -- widen to the template's own size,
+            # clipped to the search image's bounds, rather than crash.
+            y1 = min(sh, y0 + th)
+            x1 = min(sw, x0 + tw)
+            y0 = max(0, y1 - th)
+            x0 = max(0, x1 - tw)
+        crop = search[y0:y1, x0:x1]
+
+        scores = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, (local_x, local_y) = cv2.minMaxLoc(scores)
+        top_x, top_y = x0 + local_x, y0 + local_y
+
+        if template_is_ref:
+            dx, dy = -top_x, -top_y
+        else:
+            dx, dy = top_x, top_y
+
+        per_angle_scores.append((float(angle), float(score)))
+        if best is None or score > best[0]:
+            best = (float(score), float(angle), float(dx), float(dy))
+
+    best_score, best_angle, dx, dy = best
+    rot_2x3 = cv2.getRotationMatrix2D(center, best_angle, 1.0)
+    rot_2x3 = rot_2x3.copy()
+    rot_2x3[0, 2] += dx
+    rot_2x3[1, 2] += dy
+    return rot_2x3, best_angle, best_score, per_angle_scores, dx, dy
+
+
 def override_tissue_free_blocks(matrices_np, raw_valid, grid_shape, coarse_matrix):
     """Blocks with no raw local-refinement signal (typically tissue-free
     background) are, by default, filled in by palom's constrain_shifts()
@@ -211,7 +311,8 @@ def override_tissue_free_blocks(matrices_np, raw_valid, grid_shape, coarse_matri
 def main(hires_path, cytassist_path, output_dir, sample="sample",
          block_step=128, block_size=None, n_keypoints=12000, thumbnail_level=2,
          scale_tol=0.15, extra_mirror_x=False, manual_translation=None,
-         rotation_search_deg=10.0, rotation_search_step=0.5):
+         rotation_search_deg=10.0, rotation_search_step=0.5,
+         manual_translation_search_margin=150.0):
     import palom  # only needed here; keep it optional at import time for common.py users
     import palom.register_util as register_util
 
@@ -275,21 +376,63 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
     )
 
     if manual_translation is not None:
-        # Skip both the ORB fit and the correlation fallback entirely -- use
-        # a translation-only coarse affine supplied directly (in full
-        # CytAssist-scale pixel units; converted to thumbnail-scale here
-        # since aligner.affine_matrix rescales coarse_affine_matrix back up
-        # automatically via ref/moving_thumbnail_down_factor). For samples
-        # where automatic coarse registration can't be trusted at all (e.g.
-        # repetitive tissue + limited FOV overlap -- see NMR3_Colon), this
-        # lets a manually-derived translation (from a rough location hint
-        # plus e.g. ring-centroid matching) be used directly.
+        # Skip the ORB fit and the OPEN-ENDED correlation fallback entirely
+        # (both already known to fail for this sample -- typically repetitive
+        # tissue + limited FOV overlap, e.g. NMR3_Colon/NMR3_DRG), but DO NOT
+        # assume rotation=0: a manually-seeded translation only tells us
+        # roughly where the image sits, not that HiRes and CytAssist are
+        # perfectly axis-aligned. Bug found 2026-09-27 (NMR3_DRG): assuming
+        # rotation=0 here left a real ~0.5deg rotation completely out of the
+        # exported coarse affine (cytAssistInfo.transformImages) -- the
+        # per-block local refinement still ends up geometrically correct (a
+        # small rotation shows up as a smooth per-block translation gradient
+        # it can absorb), but the exported single global affine was then
+        # wrong by ~30px at the image edges, and the local refinement was
+        # carrying a full-frame rotation it wasn't designed for. Fix: refine
+        # a FULL affine (rotation sweep, +/- --rotation-search-deg, PLUS a
+        # translation search) around the manual seed, with the translation
+        # search restricted to a small window (+/-
+        # --manual-translation-search-margin px, full-scale) around that
+        # seed -- narrow enough that it can't re-converge to the same wrong,
+        # far-away optimum that made the manual override necessary in the
+        # first place, but wide enough to find the true rotation and any
+        # small accompanying translation correction.
         man_dx, man_dy = manual_translation
-        print(f"Using manually-supplied translation-only coarse affine: "
-              f"dx={man_dx:.1f} dy={man_dy:.1f} (full/CytAssist-scale units) -- "
-              "skipping ORB fit and correlation fallback entirely.")
-        thumb_matrix = np.array([[1.0, 0.0, man_dx / factor], [0.0, 1.0, man_dy / factor]])
-        aligner.coarse_affine_matrix = np.vstack([thumb_matrix, [0, 0, 1]])
+        print(f"Manually-supplied seed translation: dx={man_dx:.1f} dy={man_dy:.1f} "
+              "(full/CytAssist-scale units). Refining a full affine (rotation "
+              f"+/-{rotation_search_deg:.1f} deg, translation search restricted to "
+              f"+/-{manual_translation_search_margin:.0f}px of the seed, full-scale) "
+              "around it, rather than assuming rotation=0 -- skipping ORB and the "
+              "open-ended correlation fallback (both already ruled out for this sample).")
+        seed_dx_thumb, seed_dy_thumb = man_dx / factor, man_dy / factor
+        margin_thumb = manual_translation_search_margin / factor
+        refined_matrix, best_angle, best_score, per_angle_scores, ref_dx_thumb, ref_dy_thumb = (
+            refine_rotation_and_translation_near_seed(
+                ref_thumbnail, moving_thumbnail, seed_dx_thumb, seed_dy_thumb,
+                angle_range=(-rotation_search_deg, rotation_search_deg),
+                angle_step=rotation_search_step, search_margin=margin_thumb,
+            )
+        )
+        rotation_correction_deg = best_angle
+        ref_dx_full, ref_dy_full = ref_dx_thumb * factor, ref_dy_thumb * factor
+        print(f"Manual-translation-seeded affine refinement: best_angle={best_angle:+.2f} deg "
+              f"(score={best_score:.4f}); refined translation=({ref_dx_full:.1f},{ref_dy_full:.1f}) "
+              f"full-scale (seed was ({man_dx:.1f},{man_dy:.1f}))")
+        if abs(best_angle) >= (rotation_search_deg - rotation_search_step):
+            msg = (f"winning angle ({best_angle:+.1f} deg) is at the edge of the searched "
+                   f"+/-{rotation_search_deg:.1f} deg range -- the true angle may lie outside "
+                   "it; widen --rotation-search-deg and re-run if the QC report looks wrong.")
+            print(f"WARNING: {msg}")
+            warnings.append(msg)
+        if (abs(ref_dx_full - man_dx) > manual_translation_search_margin * 0.9
+                or abs(ref_dy_full - man_dy) > manual_translation_search_margin * 0.9):
+            msg = (f"refined translation ({ref_dx_full:.1f},{ref_dy_full:.1f}) landed close to "
+                   f"the edge of the +/-{manual_translation_search_margin:.0f}px search window "
+                   "around the manual seed -- consider widening "
+                   "--manual-translation-search-margin and re-running.")
+            print(f"WARNING: {msg}")
+            warnings.append(msg)
+        aligner.coarse_affine_matrix = np.vstack([refined_matrix, [0, 0, 1]])
         used_phase_fallback = False
     else:
         aligner.coarse_register_affine(n_keypoints=n_keypoints)
@@ -465,10 +608,21 @@ if __name__ == "__main__":
                          "own orientation choice -- needed on samples where that function itself gets "
                          "fooled by repetitive/self-similar tissue (see NMR3_Colon in the project notes)")
     p.add_argument("--manual-translation", type=float, nargs=2, default=None, metavar=("DX", "DY"),
-                    help="skip the ORB fit and correlation fallback entirely and use this translation-only "
-                         "coarse affine directly (full/CytAssist-scale pixel units, applied AFTER "
-                         "--extra-mirror-x if both are given). For samples where automatic coarse "
-                         "registration can't be trusted (e.g. repetitive tissue + limited FOV overlap).")
+                    help="skip the ORB fit and the open-ended correlation fallback, seeding a full "
+                         "affine (rotation + translation) refinement at this translation instead of "
+                         "assuming rotation=0 (full/CytAssist-scale pixel units, applied AFTER "
+                         "--extra-mirror-x if both are given). See --rotation-search-deg/-step for "
+                         "the rotation search range and --manual-translation-search-margin for how "
+                         "far the translation may move from this seed. For samples where automatic "
+                         "coarse registration can't be trusted at all (e.g. repetitive tissue + "
+                         "limited FOV overlap).")
+    p.add_argument("--manual-translation-search-margin", type=float, default=150.0,
+                    help="with --manual-translation: how far (px, full/CytAssist-scale) the "
+                         "translation search is allowed to move away from the manual seed while "
+                         "refining rotation. Wide enough to correct a real small offset error in "
+                         "the seed, narrow enough to never re-converge to the wrong, far-away "
+                         "optimum that made the manual override necessary in the first place. "
+                         "Default 150.0.")
     p.add_argument("--rotation-search-deg", type=float, default=10.0,
                     help="explicit small-angle rotation search range in degrees (+/-), applied before the "
                          "ORB coarse fit to catch residual rotations ORB under-detects on repetitive/"
@@ -483,4 +637,5 @@ if __name__ == "__main__":
          n_keypoints=args.n_keypoints, thumbnail_level=args.thumbnail_level,
          scale_tol=args.scale_tol, extra_mirror_x=args.extra_mirror_x,
          manual_translation=tuple(args.manual_translation) if args.manual_translation else None,
-         rotation_search_deg=args.rotation_search_deg, rotation_search_step=args.rotation_search_step)
+         rotation_search_deg=args.rotation_search_deg, rotation_search_step=args.rotation_search_step,
+         manual_translation_search_margin=args.manual_translation_search_margin)
