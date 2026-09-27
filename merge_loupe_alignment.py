@@ -25,10 +25,19 @@ slide+area -- the one Space Ranger's own automatic fiducial/spot detection
 produced for this slide (or a Loupe-exported one), which already has
 correct, complete `oligo` / `spot_metadata` / `metadata` / `slide_layout_file`
 / `spot_count` / `transform` / `checksum` sections -- and only overwrite the
-one piece our pipeline actually corrects: `cytAssistInfo.transformImages`
-(the CytAssist<->HiRes image registration). Everything else about spot/
-fiducial calibration on the CytAssist image itself is untouched, since our
-pipeline never touches that.
+piece(s) our pipeline actually corrects:
+
+  - `cytAssistInfo.transformImages` (the CytAssist<->HiRes image
+    registration) -- always replaced.
+  - `oligo` (the tissue-detection bitmask) -- replaced only when
+    `--tissue-mask` is given, using our own tissue calls (e.g. from
+    `tissue_detection_pipeline.py`) instead of the base file's own tissue
+    detection. See `oligo_tissue.py` for how this is encoded, and the
+    project doc "tissue_oligo_encoding" for why the transform convention
+    it uses is trustworthy. `transform`, `spot_metadata`, `metadata`,
+    `slide_layout_file`, `spot_count` are NEVER touched -- they describe
+    the base file's own (trusted) fiducial calibration, which this
+    pipeline never re-derives.
 
 `cytAssistInfo.checksumHiRes` looks like an MD5 of the HiRes image file the
 alignment was computed against (32 hex chars); since we're now pairing this
@@ -51,11 +60,23 @@ Usage:
       --output-dir .
     # writes ./H1-RCH86GZ-D1-fiducials-image-registration.json (serial/area
     # taken from the base file), overwriting nothing outside --output-dir
+
+    # also replace tissue (oligo) with our own tissue mask:
+    python merge_loupe_alignment.py \\
+      --base-json H1-RCH86GZ-D1-fiducials-image-registration.json \\
+      --our-json NMR2_DRG_global_affine.json \\
+      --image NMR2_DRG_local_warp_only.ome.tif \\
+      --tissue-mask NMR2_DRG_tissue_mask.png \\
+      --output-dir .
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
+
+import cv2
+
+import oligo_tissue
 
 
 def md5_of_file(path, chunk_size=8 * 1024 * 1024):
@@ -76,7 +97,8 @@ def default_output_name(serial_number, area):
     return f"{serial_number}-{area}-fiducials-image-registration.json"
 
 
-def main(base_json, our_json, image_path, output_path=None, output_dir="."):
+def main(base_json, our_json, image_path, output_path=None, output_dir=".",
+         tissue_mask_path=None, tissue_aggregation="majority", tissue_supersample=4):
     base = json.loads(Path(base_json).read_text())
     ours = json.loads(Path(our_json).read_text())
 
@@ -104,13 +126,33 @@ def main(base_json, our_json, image_path, output_path=None, output_dir="."):
               "(<1% scale, <~90px translation) -- double check this is the right base file "
               "before trusting the merged output.")
 
-    merged = dict(base)  # shallow copy is fine -- we only replace top-level cytAssistInfo
+    merged = dict(base)  # shallow copy is fine -- we only replace top-level keys
     print(f"computing MD5 of {image_path} for cytAssistInfo.checksumHiRes ...")
     checksum = md5_of_file(image_path)
     merged["cytAssistInfo"] = {
         "checksumHiRes": checksum,
         "transformImages": ours_m,
     }
+
+    if tissue_mask_path is not None:
+        print(f"encoding tissue mask {tissue_mask_path} into oligo "
+              f"(aggregation={tissue_aggregation}, supersample={tissue_supersample}) ...")
+        mask_img = cv2.imread(str(tissue_mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask_img is None:
+            raise SystemExit(f"could not read tissue mask image {tissue_mask_path}")
+        mask = mask_img > 0
+        # validates base's bin_level/transform/spot_count itself -- raises
+        # rather than silently proceeding if this base file doesn't match
+        # the verified convention (see oligo_tissue.py).
+        new_oligo, grid = oligo_tissue.build_oligo_from_tissue_mask(
+            base_json, mask, aggregation=tissue_aggregation, supersample=tissue_supersample)
+        base_tissue_frac = oligo_tissue.decode_oligo(base)[0].mean()
+        print(f"base file's own oligo tissue fraction: {base_tissue_frac:.4f}; "
+              f"our tissue mask's encoded fraction: {grid.mean():.4f}")
+        merged["oligo"] = new_oligo
+    else:
+        print("no --tissue-mask given: oligo copied unchanged from the base file "
+              "(base file's own tissue detection is kept as-is)")
 
     if output_path is None:
         output_path = Path(output_dir) / default_output_name(base["serialNumber"], base["area"])
@@ -123,9 +165,11 @@ def main(base_json, our_json, image_path, output_path=None, output_dir="."):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(json.dumps(merged))
     print(f"wrote {output_path} (checksumHiRes={checksum})")
-    print("all other keys (oligo, spot_metadata, metadata, slide_layout_file, spot_count, "
-          "transform, serialNumber, area, checksum, removeImagePages) copied unchanged from "
-          f"{base_json}")
+    unchanged_keys = "spot_metadata, metadata, slide_layout_file, spot_count, transform, " \
+                     "serialNumber, area, checksum, removeImagePages"
+    if tissue_mask_path is None:
+        unchanged_keys = "oligo, " + unchanged_keys
+    print(f"unchanged from {base_json}: {unchanged_keys}")
 
 
 if __name__ == "__main__":
@@ -134,9 +178,20 @@ if __name__ == "__main__":
                     help="Space Ranger / Loupe's own complete alignment export for this slide+area")
     p.add_argument("--our-json", required=True, help="our cytAssistInfo-only *_global_affine.json")
     p.add_argument("--image", required=True, help="the corrected *_local_warp_only.ome.tif")
+    p.add_argument("--tissue-mask", default=None,
+                    help="optional: a 0/255 single-channel tissue mask PNG in CytAssist pixel "
+                         "space (e.g. tissue_detection_pipeline.py's *_tissue_mask.png) to encode "
+                         "into oligo, replacing the base file's own tissue detection. If omitted, "
+                         "oligo is copied unchanged from --base-json.")
+    p.add_argument("--tissue-aggregation", choices=["any", "majority"], default="majority",
+                    help="only used with --tissue-mask; see oligo_tissue.py for details")
+    p.add_argument("--tissue-supersample", type=int, default=4,
+                    help="only used with --tissue-mask; see oligo_tissue.py for details")
     p.add_argument("--output", default=None,
                     help="explicit output path; default is 10x's own naming convention "
                          "(<serialNumber>-<area>-fiducials-image-registration.json) under --output-dir")
     p.add_argument("--output-dir", default=".", help="used only when --output is not given")
     args = p.parse_args()
-    main(args.base_json, args.our_json, args.image, args.output, args.output_dir)
+    main(args.base_json, args.our_json, args.image, args.output, args.output_dir,
+         tissue_mask_path=args.tissue_mask, tissue_aggregation=args.tissue_aggregation,
+         tissue_supersample=args.tissue_supersample)
