@@ -341,8 +341,16 @@ def _b64_thumbnail(path, max_width=1400):
 
 
 def write_html_report(sample, stats, qc_path, quiver_path, quiver_stats,
-                       before_after_path, whole_region_path, whole_region_stats, out_path):
+                       before_after_path, whole_region_path, whole_region_stats,
+                       tissue_paths, out_path):
     warn_html = "".join(f"<li>{w}</li>" for w in stats["warnings"]) or "<li>none</li>"
+    # n_full_attempts_used / quality_check_passed only exist in run_stats.json
+    # written by the automatic-retry-loop register.py (2026-09-28 onward) --
+    # older runs won't have them, so fall back rather than KeyError.
+    n_attempts = stats.get("n_full_attempts_used",
+                            "n/a (built before the automatic retry loop was added)")
+    quality_passed = stats.get("quality_check_passed",
+                                "n/a (built before the automatic retry loop was added)")
     rows = {
         "Coarse scale (x, y)": f"{stats['coarse_scale'][0]:.4f}, {stats['coarse_scale'][1]:.4f}",
         "Coarse rotation": f"{stats['coarse_angle_deg']:.2f} deg",
@@ -350,6 +358,8 @@ def write_html_report(sample, stats, qc_path, quiver_path, quiver_stats,
         "Used phase-correlation fallback": stats["used_phase_fallback"],
         "Extra mirror-x applied": stats["extra_mirror_x"],
         "Manual translation seed": stats["manual_translation"],
+        "Full registration attempts used": n_attempts,
+        "Quality check passed (auto retry loop)": quality_passed,
         "Block grid": f"{stats['grid_shape'][0]} x {stats['grid_shape'][1]} "
                        f"({stats['n_blocks_total']} blocks, step={stats['block_step']}px)",
         "Blocks with raw local signal": f"{stats['n_blocks_valid_raw']}/{stats['n_blocks_total']}",
@@ -359,6 +369,21 @@ def write_html_report(sample, stats, qc_path, quiver_path, quiver_stats,
         "Preview coverage": f"{stats['coverage']:.4f}",
     }
     row_html = "".join(f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in rows.items())
+
+    if tissue_paths:
+        mask_path, overlay_path = tissue_paths
+        tissue_section_html = f"""<h2>Tissue detection</h2>
+<p>The tissue mask used to encode this sample's own tissue calls into the merged
+alignment JSON's <code>oligo</code> field -- independent of the registration
+itself (from tissue_detection_pipeline.py, run on the raw CytAssist image).</p>
+<table><tr>
+<td style="width:50%; vertical-align:top;"><p>Mask</p>
+<img src="data:image/png;base64,{_b64_img(mask_path)}"></td>
+<td style="width:50%; vertical-align:top;"><p>Overlay on CytAssist image</p>
+<img src="data:image/png;base64,{_b64_img(overlay_path)}"></td>
+</tr></table>"""
+    else:
+        tissue_section_html = ""
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>{sample} registration QC report</title>
@@ -379,6 +404,8 @@ img {{ max-width: 100%; border: 1px solid #ddd; }}
 <table>{row_html}</table>
 
 <div class="warn"><b>Warnings raised during this run:</b><ul>{warn_html}</ul></div>
+
+{tissue_section_html}
 
 <h2>CytAssist-scale overlay (red=HiRes, green=CytAssist, yellow=aligned)</h2>
 <p>Fast sanity-check preview at CytAssist's own resolution. Already includes the
@@ -408,7 +435,7 @@ downscaled to keep the report itself small -- open <code>{Path(whole_region_path
 
 
 def main(sample, output_dir, hires_path, cytassist_rgb_path=None, cap_long_side=12000,
-         before_after_cap=3000):
+         before_after_cap=3000, median_correction_threshold_px=2.0):
     output_dir = Path(output_dir)
     transform = np.load(output_dir / f"{sample}_transform.npz", allow_pickle=True)
     stats = json.loads((output_dir / f"{sample}_run_stats.json").read_text())
@@ -420,6 +447,19 @@ def main(sample, output_dir, hires_path, cytassist_rgb_path=None, cap_long_side=
 
     qc_path = build_qc_overlay(sample, output_dir, cyt_rgb, output_dir / f"{sample}_qc_overlay.jpg")
     quiver_path, quiver_stats = build_warp_quiver(sample, transform, cyt_rgb, output_dir / f"{sample}_warp_quiver.png")
+    if quiver_stats["median_correction_px"] > median_correction_threshold_px:
+        # Distinct from register.py's own max-based check (which catches a few
+        # wild outlier blocks): a high MEDIAN means most blocks, not just a
+        # few, needed a bigger-than-expected correction -- a sign the coarse
+        # alignment may be systematically off across the tissue, not just
+        # locally noisy in a couple of spots.
+        msg = (f"median local-warp correction ({quiver_stats['median_correction_px']:.1f}px) "
+               f"exceeds {median_correction_threshold_px:.1f}px -- real per-block corrections "
+               "are usually small and this suggests the coarse alignment may be systematically "
+               "off across most of the tissue. Inspect the warp-quiver plot and overlay "
+               "carefully before trusting this run.")
+        print(f"WARNING: {msg}")
+        stats = {**stats, "warnings": [*stats.get("warnings", []), msg]}
     before_after_path = build_before_after_comparison(
         sample, transform, hires_path, cyt_rgb, output_dir / f"{sample}_before_after.jpg",
         cap_long_side=before_after_cap)
@@ -427,9 +467,17 @@ def main(sample, output_dir, hires_path, cytassist_rgb_path=None, cap_long_side=
         sample, transform, hires_path, cyt_rgb, output_dir / f"{sample}_whole_region_overlay.jpg",
         cap_long_side=cap_long_side)
 
+    tissue_dir = output_dir / "tissue_detection"
+    mask_path = tissue_dir / f"{sample}_tissue_mask.png"
+    overlay_path = tissue_dir / f"{sample}_tissue_overlay.png"
+    tissue_paths = (mask_path, overlay_path) if mask_path.exists() and overlay_path.exists() else None
+    if tissue_paths is None:
+        print(f"NOTE: tissue detection images not found at {mask_path} / {overlay_path} -- "
+              "report will skip that section (run tissue_detection_pipeline.py first to include it).")
+
     report_path = write_html_report(sample, stats, qc_path, quiver_path, quiver_stats,
                                      before_after_path, whole_region_path, whole_region_stats,
-                                     output_dir / f"{sample}_report.html")
+                                     tissue_paths, output_dir / f"{sample}_report.html")
     print(f"Wrote {report_path}")
     return report_path
 
@@ -444,8 +492,14 @@ if __name__ == "__main__":
                     help="max long-side pixels for the whole-region overlay JPEG")
     p.add_argument("--before-after-cap", type=int, default=3000,
                     help="max long-side pixels (per panel) for the before/after comparison JPEG")
+    p.add_argument("--median-correction-threshold-px", type=float, default=2.0,
+                    help="warn in the report if the median per-block local-warp correction "
+                         "exceeds this many px -- unlike register.py's own max-based check "
+                         "(a few outlier blocks), this flags a systematic offset across most "
+                         "of the tissue. Default 2.0.")
     p.add_argument("--log-dir", default=None,
                     help="where <sample>_pipeline.log lives; default: --output-dir.")
     args = p.parse_args()
     setup_pipeline_log(args.log_dir or args.output_dir, args.sample, "report.py")
-    main(args.sample, args.output_dir, args.hires, args.cytassist, args.cap_long_side, args.before_after_cap)
+    main(args.sample, args.output_dir, args.hires, args.cytassist, args.cap_long_side,
+         args.before_after_cap, args.median_correction_threshold_px)
