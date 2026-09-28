@@ -336,9 +336,12 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
          block_step=128, block_size=None, n_keypoints=12000, thumbnail_level=2,
          scale_tol=0.15, extra_mirror_x=False, manual_translation=None,
          rotation_search_deg=10.0, rotation_search_step=0.5,
-         manual_translation_search_margin=150.0):
+         manual_translation_search_margin=150.0,
+         max_full_attempts=6, max_correction_threshold_px=25.0,
+         min_raw_valid_frac=0.2):
     import palom  # only needed here; keep it optional at import time for common.py users
     import palom.register_util as register_util
+    from build_full_res_deliverables import get_block_matrix
 
     logging.getLogger("palom").setLevel(logging.WARNING)
     block_size = block_size or 2 * block_step
@@ -351,254 +354,306 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
     print(f"CytAssist pixel size: {cyt_um_per_px:.4f} um/px")
 
     # Hd: HiRes downsampled to match CytAssist's pixel size, but NOT YET
-    # flipped/rotated/mirrored into CytAssist's orientation.
-    hires_rgb = downsample_to_physical_scale(hires_path, cyt_um_per_px)
-    hd_shape = hires_rgb.shape[:2]
+    # flipped/rotated/mirrored into CytAssist's orientation. Computed once,
+    # outside the retry loop below -- only the orientation/coarse-fit/
+    # local-refinement steps are stochastic and worth retrying.
+    hires_rgb0 = downsample_to_physical_scale(hires_path, cyt_um_per_px)
+    hd_shape = hires_rgb0.shape[:2]
     cyt_rgb = load_cytassist_rgb(cytassist_path)
-    hires_gray = hires_rgb.astype("float32").mean(axis=-1)
+    hires_gray0 = hires_rgb0.astype("float32").mean(axis=-1)
     cyt_gray = cyt_rgb.astype("float32").mean(axis=-1)
 
-    warnings = []  # collected here, saved to <sample>_run_stats.json for report.py
+    def one_attempt(attempt_num):
+        """One full pass: resolve the flip/rotation ambiguity, fit a coarse
+        affine, run the per-block local refinement, and score the result.
 
-    print("Resolving flip/rotation ambiguity...")
-    flip_rotate_func, orientation_matrix = palom.register.match_test_flip_rotate(cyt_gray, hires_gray)
-    hires_gray = flip_rotate_func(hires_gray)
-    hires_rgb = np.stack([flip_rotate_func(hires_rgb[..., c]) for c in range(3)], axis=-1)
-    print(f"Oriented HiRes shape: {hires_rgb.shape}")
+        Both match_test_flip_rotate (palom's own orientation search) and the
+        ORB+RANSAC coarse fit are known (2026-09-27, this project) to be
+        non-deterministic run-to-run on identical inputs -- either one can
+        pick a wrong-but-plausible-looking answer on an unlucky draw, most
+        often on repetitive/self-similar tissue. Neither `coverage` nor
+        raw_valid_frac alone reliably catches this: a wrong global alignment
+        on repetitive tissue can still find plenty of raw local "matches" --
+        just wrong, far-away ones. Confirmed on this project's real data:
+        NMR2_Colon's own bad run had a HIGHER raw_valid_frac (89.8%) than
+        its correct run (64.3%), so gating on raw_valid_frac alone would
+        have preferred the wrong answer.
 
-    if extra_mirror_x:
-        # match_test_flip_rotate does its own ORB-based orientation search,
-        # and on highly repetitive/self-similar tissue it can be fooled the
-        # same way the coarse ORB+RANSAC fit can: it only tests half of the
-        # 16 possible flip x rotation combinations (an optimization that
-        # assumes rotational equivalence, which doesn't hold for non-square
-        # images), so it can miss an orientation that needed a horizontal
-        # mirror it never tried. Found on NMR3_Colon via an independent
-        # check (ring-centroid pattern voting against a rough user-supplied
-        # location hint): with this extra mirror, all 6 CytAssist tissue
-        # rings simultaneously matched HiRes rings under one consistent
-        # translation (vs. at most 2/6 without it).
-        print("Applying additional user-specified horizontal (x) mirror on top of "
-              "match_test_flip_rotate's own choice.")
-        extra_mirror_matrix = register_util.get_flip_mx(hires_gray.shape, 1)
-        orientation_matrix = extra_mirror_matrix @ orientation_matrix
-        hires_gray = hires_gray[:, ::-1].copy()
-        hires_rgb = hires_rgb[:, ::-1, :].copy()
+        The signal that DOES reliably separate them, checked empirically on
+        this project's real data: how far the per-block local match needs
+        to move away from the single coarse affine's own prediction. Real
+        physical tissue distortion is small (this project's confirmed-
+        correct runs: 3.6-10.8px max); a spurious match papering over a
+        wrong global alignment is not (the one confirmed-wrong run: 57.7px
+        max). See --max-correction-threshold-px.
+        """
+        warnings_local = []
+        print(f"[attempt {attempt_num}] Resolving flip/rotation ambiguity...")
+        flip_rotate_func, orientation_matrix = palom.register.match_test_flip_rotate(cyt_gray, hires_gray0)
+        hires_gray = flip_rotate_func(hires_gray0)
+        hires_rgb = np.stack([flip_rotate_func(hires_rgb0[..., c]) for c in range(3)], axis=-1)
+        print(f"[attempt {attempt_num}] Oriented HiRes shape: {hires_rgb.shape}")
 
-    rotation_correction_deg = None
-    chunk = (block_step, block_step)
-    hires_gray_da = da.from_array(hires_gray, chunks=chunk)
-    cyt_gray_da = da.from_array(cyt_gray, chunks=chunk)
-    factor = 2 ** thumbnail_level
-    ref_thumbnail = cyt_gray_da[::factor, ::factor].compute()
-    moving_thumbnail = hires_gray_da[::factor, ::factor].compute()
-    aligner = palom.align.Aligner(
-        ref_img=cyt_gray_da, moving_img=hires_gray_da,
-        ref_thumbnail=ref_thumbnail,
-        moving_thumbnail=moving_thumbnail,
-        ref_thumbnail_down_factor=factor, moving_thumbnail_down_factor=factor,
-    )
+        if extra_mirror_x:
+            print(f"[attempt {attempt_num}] Applying additional user-specified horizontal (x) "
+                  "mirror on top of match_test_flip_rotate's own choice.")
+            extra_mirror_matrix = register_util.get_flip_mx(hires_gray.shape, 1)
+            orientation_matrix = extra_mirror_matrix @ orientation_matrix
+            hires_gray = hires_gray[:, ::-1].copy()
+            hires_rgb = hires_rgb[:, ::-1, :].copy()
 
-    if manual_translation is not None:
-        # Skip the ORB fit and the OPEN-ENDED correlation fallback entirely
-        # (both already known to fail for this sample -- typically repetitive
-        # tissue + limited FOV overlap, e.g. NMR3_Colon/NMR3_DRG), but DO NOT
-        # assume rotation=0: a manually-seeded translation only tells us
-        # roughly where the image sits, not that HiRes and CytAssist are
-        # perfectly axis-aligned. Bug found 2026-09-27 (NMR3_DRG): assuming
-        # rotation=0 here left a real ~0.5deg rotation completely out of the
-        # exported coarse affine (cytAssistInfo.transformImages) -- the
-        # per-block local refinement still ends up geometrically correct (a
-        # small rotation shows up as a smooth per-block translation gradient
-        # it can absorb), but the exported single global affine was then
-        # wrong by ~30px at the image edges, and the local refinement was
-        # carrying a full-frame rotation it wasn't designed for. Fix: refine
-        # a FULL affine (rotation sweep, +/- --rotation-search-deg, PLUS a
-        # translation search) around the manual seed, with the translation
-        # search restricted to a small window (+/-
-        # --manual-translation-search-margin px, full-scale) around that
-        # seed -- narrow enough that it can't re-converge to the same wrong,
-        # far-away optimum that made the manual override necessary in the
-        # first place, but wide enough to find the true rotation and any
-        # small accompanying translation correction.
-        man_dx, man_dy = manual_translation
-        print(f"Manually-supplied seed translation: dx={man_dx:.1f} dy={man_dy:.1f} "
-              "(full/CytAssist-scale units). Refining a full affine (rotation "
-              f"+/-{rotation_search_deg:.1f} deg, translation search restricted to "
-              f"+/-{manual_translation_search_margin:.0f}px of the seed, full-scale) "
-              "around it, rather than assuming rotation=0 -- skipping ORB and the "
-              "open-ended correlation fallback (both already ruled out for this sample).")
-        seed_dx_thumb, seed_dy_thumb = man_dx / factor, man_dy / factor
-        margin_thumb = manual_translation_search_margin / factor
-        refined_matrix, best_angle, best_score, per_angle_scores, ref_dx_thumb, ref_dy_thumb = (
-            refine_rotation_and_translation_near_seed(
-                ref_thumbnail, moving_thumbnail, seed_dx_thumb, seed_dy_thumb,
-                angle_range=(-rotation_search_deg, rotation_search_deg),
-                angle_step=rotation_search_step, search_margin=margin_thumb,
-            )
+        rotation_correction_deg = None
+        chunk = (block_step, block_step)
+        hires_gray_da = da.from_array(hires_gray, chunks=chunk)
+        cyt_gray_da = da.from_array(cyt_gray, chunks=chunk)
+        factor = 2 ** thumbnail_level
+        ref_thumbnail = cyt_gray_da[::factor, ::factor].compute()
+        moving_thumbnail = hires_gray_da[::factor, ::factor].compute()
+        aligner = palom.align.Aligner(
+            ref_img=cyt_gray_da, moving_img=hires_gray_da,
+            ref_thumbnail=ref_thumbnail,
+            moving_thumbnail=moving_thumbnail,
+            ref_thumbnail_down_factor=factor, moving_thumbnail_down_factor=factor,
         )
-        rotation_correction_deg = best_angle
-        ref_dx_full, ref_dy_full = ref_dx_thumb * factor, ref_dy_thumb * factor
-        print(f"Manual-translation-seeded affine refinement: best_angle={best_angle:+.2f} deg "
-              f"(score={best_score:.4f}); refined translation=({ref_dx_full:.1f},{ref_dy_full:.1f}) "
-              f"full-scale (seed was ({man_dx:.1f},{man_dy:.1f}))")
-        if abs(best_angle) >= (rotation_search_deg - rotation_search_step):
-            msg = (f"winning angle ({best_angle:+.1f} deg) is at the edge of the searched "
-                   f"+/-{rotation_search_deg:.1f} deg range -- the true angle may lie outside "
-                   "it; widen --rotation-search-deg and re-run if the QC report looks wrong.")
-            print(f"WARNING: {msg}")
-            warnings.append(msg)
-        if (abs(ref_dx_full - man_dx) > manual_translation_search_margin * 0.9
-                or abs(ref_dy_full - man_dy) > manual_translation_search_margin * 0.9):
-            msg = (f"refined translation ({ref_dx_full:.1f},{ref_dy_full:.1f}) landed close to "
-                   f"the edge of the +/-{manual_translation_search_margin:.0f}px search window "
-                   "around the manual seed -- consider widening "
-                   "--manual-translation-search-margin and re-running.")
-            print(f"WARNING: {msg}")
-            warnings.append(msg)
-        aligner.coarse_affine_matrix = np.vstack([refined_matrix, [0, 0, 1]])
-        used_phase_fallback = False
-    else:
-        # ORB+RANSAC found (2026-09-27, NMR2_Colon) to be genuinely
-        # non-deterministic run-to-run on the SAME images with the SAME
-        # code: one run cleanly found angle=-91.20deg with no warnings, the
-        # very next run on identical inputs got an implausible scale,
-        # triggered the correlation-search fallback, and landed on an
-        # ambiguous, wrong optimum (own diagnostic: "top two correlation
-        # peaks within 0.05") -- silently, if not for a visual QC check of
-        # the resulting warp-quiver plot. Since a plausible fit IS
-        # consistently achievable on these same inputs, retry the SAME
-        # reliable method a few times (a fresh ORB/RANSAC draw each time)
-        # before reaching for the correlation-search fallback, which is
-        # known to be less reliable on repetitive/self-similar tissue.
-        max_orb_attempts = 5
-        for attempt in range(1, max_orb_attempts + 1):
-            aligner.coarse_register_affine(n_keypoints=n_keypoints)
-            plausible, _, _, _ = scale_angle_plausible(aligner.affine_matrix, scale_tol)
-            if plausible:
-                if attempt > 1:
-                    msg = (f"ORB coarse fit looked implausible on attempt(s) 1-{attempt - 1} "
-                           f"(non-deterministic RANSAC draw) but attempt {attempt} looks "
-                           "plausible -- using it.")
-                    print(f"NOTE: {msg}")
-                    warnings.append(msg)
-                break
-        else:
-            print(f"ORB coarse fit looked implausible on all {max_orb_attempts} attempts "
-                  "-- falling back to the correlation search below.")
-        used_phase_fallback = False
 
-    m = aligner.affine_matrix
-    scale_x, scale_y, angle = scale_angle_plausible(m, scale_tol)[1:]
-    print(f"Coarse affine: scale=({scale_x:.4f},{scale_y:.4f}) angle={angle:.2f} deg "
-          "-- scale should be close to 1.0")
-
-    plausible, _, _, _ = scale_angle_plausible(m, scale_tol)
-    angle_implausible = not plausible and not (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol)
-    if manual_translation is None and not plausible:
-        reason = "scale far from 1.0" if not angle_implausible else "implausible rotation angle"
-        if angle_implausible and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol):
-            reason = "scale far from 1.0 and implausible rotation angle"
-        msg = (f"coarse ORB-based fit looks wrong ({reason}) -- likely failed (common on "
-               "repetitive/self-similar tissue). Falling back to a rotation-aware "
-               f"correlation search (+/-{rotation_search_deg:.1f} deg)...")
-        print(f"WARNING: {msg}")
-        warnings.append(msg)
-        try:
-            fallback_matrix, best_angle, best_score, per_angle_scores, peaks = (
-                search_rotation_translation_affine(
-                    ref_thumbnail, moving_thumbnail,
+        if manual_translation is not None:
+            man_dx, man_dy = manual_translation
+            print(f"[attempt {attempt_num}] Manually-supplied seed translation: dx={man_dx:.1f} "
+                  f"dy={man_dy:.1f} (full/CytAssist-scale units). Refining a full affine "
+                  f"(rotation +/-{rotation_search_deg:.1f} deg, translation search restricted "
+                  f"to +/-{manual_translation_search_margin:.0f}px of the seed, full-scale) "
+                  "around it, rather than assuming rotation=0 -- skipping ORB and the "
+                  "open-ended correlation fallback (both already ruled out for this sample).")
+            seed_dx_thumb, seed_dy_thumb = man_dx / factor, man_dy / factor
+            margin_thumb = manual_translation_search_margin / factor
+            refined_matrix, best_angle, best_score, per_angle_scores, ref_dx_thumb, ref_dy_thumb = (
+                refine_rotation_and_translation_near_seed(
+                    ref_thumbnail, moving_thumbnail, seed_dx_thumb, seed_dy_thumb,
                     angle_range=(-rotation_search_deg, rotation_search_deg),
-                    angle_step=rotation_search_step,
+                    angle_step=rotation_search_step, search_margin=margin_thumb,
                 )
             )
             rotation_correction_deg = best_angle
-            print(f"Rotation+translation search: best_angle={best_angle:+.2f} deg "
-                  f"(score={best_score:.4f})")
-            print("Top correlation peaks at the winning angle (score, y, x) at thumbnail "
-                  "scale -- check these aren't near-tied (a sign of repetitive-tissue "
-                  "ambiguity):")
-            for score, py, px in peaks:
-                print(f"    {score:.4f}  y={py} x={px}")
+            ref_dx_full, ref_dy_full = ref_dx_thumb * factor, ref_dy_thumb * factor
+            print(f"[attempt {attempt_num}] Manual-translation-seeded affine refinement: "
+                  f"best_angle={best_angle:+.2f} deg (score={best_score:.4f}); refined "
+                  f"translation=({ref_dx_full:.1f},{ref_dy_full:.1f}) full-scale (seed was "
+                  f"({man_dx:.1f},{man_dy:.1f}))")
             if abs(best_angle) >= (rotation_search_deg - rotation_search_step):
                 msg = (f"winning angle ({best_angle:+.1f} deg) is at the edge of the searched "
                        f"+/-{rotation_search_deg:.1f} deg range -- the true angle may lie "
                        "outside it; widen --rotation-search-deg and re-run if the QC report "
                        "looks wrong.")
                 print(f"WARNING: {msg}")
-                warnings.append(msg)
-            # fallback_matrix's translation is thumbnail-scale (same convention
-            # as coarse_register_affine's own output) -- don't rescale by
-            # `factor` here, aligner.affine_matrix does that automatically.
-            aligner.coarse_affine_matrix = np.vstack([fallback_matrix, [0, 0, 1]])
-            m = aligner.affine_matrix
-            scale_x, scale_y = np.hypot(m[0, 0], m[1, 0]), np.hypot(m[0, 1], m[1, 1])
-            angle = np.degrees(np.arctan2(m[1, 0], m[0, 0]))
-            print(f"Rotation-aware fallback affine: scale=({scale_x:.4f},{scale_y:.4f}) "
-                  f"angle={angle:.2f} deg, translation=({m[0,2]:.1f},{m[1,2]:.1f})")
-            if len(peaks) > 1 and peaks[0][0] - peaks[1][0] < 0.05:
-                msg = ("top two correlation peaks are within 0.05 of each other -- this "
-                       "translation may be ambiguous (repetitive tissue). Inspect the QC "
-                       "report carefully before trusting this run.")
+                warnings_local.append(msg)
+            if (abs(ref_dx_full - man_dx) > manual_translation_search_margin * 0.9
+                    or abs(ref_dy_full - man_dy) > manual_translation_search_margin * 0.9):
+                msg = (f"refined translation ({ref_dx_full:.1f},{ref_dy_full:.1f}) landed close "
+                       f"to the edge of the +/-{manual_translation_search_margin:.0f}px search "
+                       "window around the manual seed -- consider widening "
+                       "--manual-translation-search-margin and re-running.")
                 print(f"WARNING: {msg}")
-                warnings.append(msg)
-            used_phase_fallback = True
-        except Exception as e:
-            msg = (f"correlation-search fallback failed too ({e}) -- kept the ORB-based fit "
-                   "despite the scale warning; inspect the result carefully.")
-            print(f"WARNING: {msg}")
-            warnings.append(msg)
+                warnings_local.append(msg)
+            aligner.coarse_affine_matrix = np.vstack([refined_matrix, [0, 0, 1]])
+            used_phase_fallback = False
+        else:
+            max_orb_attempts = 5
+            for orb_attempt in range(1, max_orb_attempts + 1):
+                aligner.coarse_register_affine(n_keypoints=n_keypoints)
+                plausible, _, _, _ = scale_angle_plausible(aligner.affine_matrix, scale_tol)
+                if plausible:
+                    if orb_attempt > 1:
+                        msg = (f"ORB coarse fit looked implausible on attempt(s) 1-{orb_attempt - 1} "
+                               f"(non-deterministic RANSAC draw) but attempt {orb_attempt} looks "
+                               "plausible -- using it.")
+                        print(f"[attempt {attempt_num}] NOTE: {msg}")
+                        warnings_local.append(msg)
+                    break
+            else:
+                print(f"[attempt {attempt_num}] ORB coarse fit looked implausible on all "
+                      f"{max_orb_attempts} attempts -- falling back to the correlation search below.")
+            used_phase_fallback = False
 
-    aligner.block_size, aligner.block_step = block_size, block_step
-    print("grid_shape:", aligner.ref_img.numblocks)
-    aligner.compute_shifts()
-    raw_valid = np.isfinite(np.linalg.norm(aligner.shifts, axis=1))
-    raw_valid_frac = raw_valid.mean()
-    print(f"Blocks with valid local signal: {raw_valid.sum()}/{len(aligner.shifts)} "
-          f"({raw_valid_frac:.1%})")
-    # Found 2026-09-27 (NMR3_DRG): palom's own match_test_flip_rotate (which
-    # resolves the flip/rotation ambiguity BEFORE any of this script's own
-    # logic runs) is itself non-deterministic run-to-run on identical
-    # inputs -- one run picked one orientation (score grid had two
-    # candidates within 1 point of the winner, an easy tie to flip on
-    # keypoint-matching noise), a later run on the same images picked a
-    # 90-degree-different one instead. A wrong orientation leaves almost no
-    # real per-block local signal (12/600 valid blocks was the real case),
-    # while overall pyramid `coverage` still reports 1.0 (it only measures
-    # where the coarse-only warp places pixels, not whether the local
-    # match actually found anything) and no other check catches it. This
-    # is the cheapest, most general signal available: whatever the actual
-    # cause (wrong orientation, wrong coarse fit, wrong manual seed), if
-    # nearly all blocks fail to find local signal, something upstream is
-    # wrong and the run should not be trusted without inspection.
-    if raw_valid_frac < 0.2:
-        msg = (f"only {raw_valid.sum()}/{len(aligner.shifts)} ({raw_valid_frac:.1%}) blocks "
-               "found valid local signal -- this is far too low for a correct registration "
-               "and strongly suggests the coarse alignment (or the upstream flip/rotation "
-               "choice) is wrong, even though coverage may still look fine. Do not trust this "
-               "run without inspecting the QC report/warp-quiver plot.")
-        print(f"WARNING: {msg}")
-        warnings.append(msg)
-    if np.prod(aligner.grid_shape) >= 4:
-        try:
-            aligner.constrain_shifts()
-        except Exception as e:
-            print(f"constrain_shifts failed ({e}), using raw shifts")
+        m = aligner.affine_matrix
+        scale_x, scale_y, angle = scale_angle_plausible(m, scale_tol)[1:]
+        print(f"[attempt {attempt_num}] Coarse affine: scale=({scale_x:.4f},{scale_y:.4f}) "
+              f"angle={angle:.2f} deg -- scale should be close to 1.0")
 
-    matrices = aligner.block_affine_matrices_da
-    matrices_np = matrices.compute() if hasattr(matrices, "compute") else np.asarray(matrices)
-    n_overridden = override_tissue_free_blocks(matrices_np, raw_valid, aligner.grid_shape, m)
-    if n_overridden:
+        plausible, _, _, _ = scale_angle_plausible(m, scale_tol)
+        angle_implausible = not plausible and not (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol)
+        if manual_translation is None and not plausible:
+            reason = "scale far from 1.0" if not angle_implausible else "implausible rotation angle"
+            if angle_implausible and (abs(scale_x - 1) > scale_tol or abs(scale_y - 1) > scale_tol):
+                reason = "scale far from 1.0 and implausible rotation angle"
+            msg = (f"coarse ORB-based fit looks wrong ({reason}) -- likely failed (common on "
+                   "repetitive/self-similar tissue). Falling back to a rotation-aware "
+                   f"correlation search (+/-{rotation_search_deg:.1f} deg)...")
+            print(f"[attempt {attempt_num}] WARNING: {msg}")
+            warnings_local.append(msg)
+            try:
+                fallback_matrix, best_angle, best_score, per_angle_scores, peaks = (
+                    search_rotation_translation_affine(
+                        ref_thumbnail, moving_thumbnail,
+                        angle_range=(-rotation_search_deg, rotation_search_deg),
+                        angle_step=rotation_search_step,
+                    )
+                )
+                rotation_correction_deg = best_angle
+                print(f"[attempt {attempt_num}] Rotation+translation search: "
+                      f"best_angle={best_angle:+.2f} deg (score={best_score:.4f})")
+                print(f"[attempt {attempt_num}] Top correlation peaks at the winning angle "
+                      "(score, y, x) at thumbnail scale -- check these aren't near-tied (a "
+                      "sign of repetitive-tissue ambiguity):")
+                for score, py, px in peaks:
+                    print(f"    {score:.4f}  y={py} x={px}")
+                if abs(best_angle) >= (rotation_search_deg - rotation_search_step):
+                    msg = (f"winning angle ({best_angle:+.1f} deg) is at the edge of the "
+                           f"searched +/-{rotation_search_deg:.1f} deg range -- the true angle "
+                           "may lie outside it; widen --rotation-search-deg and re-run if the "
+                           "QC report looks wrong.")
+                    print(f"WARNING: {msg}")
+                    warnings_local.append(msg)
+                aligner.coarse_affine_matrix = np.vstack([fallback_matrix, [0, 0, 1]])
+                m = aligner.affine_matrix
+                scale_x, scale_y = np.hypot(m[0, 0], m[1, 0]), np.hypot(m[0, 1], m[1, 1])
+                angle = np.degrees(np.arctan2(m[1, 0], m[0, 0]))
+                print(f"[attempt {attempt_num}] Rotation-aware fallback affine: "
+                      f"scale=({scale_x:.4f},{scale_y:.4f}) angle={angle:.2f} deg, "
+                      f"translation=({m[0,2]:.1f},{m[1,2]:.1f})")
+                if len(peaks) > 1 and peaks[0][0] - peaks[1][0] < 0.05:
+                    msg = ("top two correlation peaks are within 0.05 of each other -- this "
+                           "translation may be ambiguous (repetitive tissue). Inspect the QC "
+                           "report carefully before trusting this run.")
+                    print(f"WARNING: {msg}")
+                    warnings_local.append(msg)
+                used_phase_fallback = True
+            except Exception as e:
+                msg = (f"correlation-search fallback failed too ({e}) -- kept the ORB-based "
+                       "fit despite the scale warning; inspect the result carefully.")
+                print(f"WARNING: {msg}")
+                warnings_local.append(msg)
+
+        aligner.block_size, aligner.block_step = block_size, block_step
+        print(f"[attempt {attempt_num}] grid_shape:", aligner.ref_img.numblocks)
+        aligner.compute_shifts()
+        raw_valid = np.isfinite(np.linalg.norm(aligner.shifts, axis=1))
+        raw_valid_frac = float(raw_valid.mean())
+        print(f"[attempt {attempt_num}] Blocks with valid local signal: {raw_valid.sum()}/"
+              f"{len(aligner.shifts)} ({raw_valid_frac:.1%})")
+        if raw_valid_frac < min_raw_valid_frac:
+            msg = (f"only {raw_valid.sum()}/{len(aligner.shifts)} ({raw_valid_frac:.1%}) blocks "
+                   "found valid local signal -- this is far too low for a correct registration "
+                   "and strongly suggests the coarse alignment (or the upstream flip/rotation "
+                   "choice) is wrong, even though coverage may still look fine.")
+            print(f"[attempt {attempt_num}] WARNING: {msg}")
+            warnings_local.append(msg)
+
+        if np.prod(aligner.grid_shape) >= 4:
+            try:
+                aligner.constrain_shifts()
+            except Exception as e:
+                print(f"[attempt {attempt_num}] constrain_shifts failed ({e}), using raw shifts")
+
+        matrices = aligner.block_affine_matrices_da
+        matrices_np = matrices.compute() if hasattr(matrices, "compute") else np.asarray(matrices)
+        n_overridden = override_tissue_free_blocks(matrices_np, raw_valid, aligner.grid_shape, m)
+        if n_overridden:
+            gr0, gc0 = aligner.grid_shape
+            print(f"[attempt {attempt_num}] Overrode {n_overridden}/{gr0 * gc0} blocks with no "
+                  "raw local signal -> coarse-only matrix (instead of extrapolated regression).")
+
+        # Local-warp correction magnitude -- same definition as report.py's
+        # own build_warp_quiver, computed here too so a bad attempt can be
+        # caught and retried BEFORE the expensive full-res build, not just
+        # noticed afterward in a QC report a human has to remember to open.
         gr, gc = aligner.grid_shape
-        print(f"Overrode {n_overridden}/{gr * gc} blocks with no raw local signal "
-              "-> coarse-only matrix (instead of extrapolated regression).")
+        dx_grid = np.array([[get_block_matrix(matrices_np, i, j)[0, 2] - m[0, 2] for j in range(gc)]
+                             for i in range(gr)])
+        dy_grid = np.array([[get_block_matrix(matrices_np, i, j)[1, 2] - m[1, 2] for j in range(gc)]
+                             for i in range(gr)])
+        correction_mag = np.hypot(dx_grid, dy_grid)
+        raw_valid_grid = raw_valid.reshape(gr, gc)
+        valid_mag = correction_mag[raw_valid_grid]
+        max_correction_px = float(valid_mag.max()) if valid_mag.size else 0.0
+        median_correction_px = float(np.median(valid_mag)) if valid_mag.size else 0.0
+        print(f"[attempt {attempt_num}] Local-warp correction among blocks with real signal: "
+              f"median={median_correction_px:.1f}px max={max_correction_px:.1f}px")
+        if max_correction_px > max_correction_threshold_px:
+            msg = (f"max local-warp correction ({max_correction_px:.1f}px) exceeds "
+                   f"--max-correction-threshold-px ({max_correction_threshold_px:.1f}px) -- "
+                   "real tissue distortion is small (this project's confirmed-correct runs: "
+                   "3.6-10.8px max); this large a correction usually means the coarse "
+                   "alignment (or the upstream flip/rotation choice) is wrong and local "
+                   "matching is papering over it with spurious, far-away matches.")
+            print(f"[attempt {attempt_num}] WARNING: {msg}")
+            warnings_local.append(msg)
+
+        ok = (max_correction_px <= max_correction_threshold_px
+              and raw_valid_frac >= min_raw_valid_frac)
+        return dict(
+            ok=ok, orientation_matrix=orientation_matrix, hires_gray=hires_gray, hires_rgb=hires_rgb,
+            m=m, scale_x=scale_x, scale_y=scale_y, angle=angle,
+            used_phase_fallback=used_phase_fallback, rotation_correction_deg=rotation_correction_deg,
+            raw_valid=raw_valid, raw_valid_frac=raw_valid_frac, matrices_np=matrices_np,
+            n_overridden=n_overridden, grid_shape=aligner.grid_shape,
+            max_correction_px=max_correction_px, median_correction_px=median_correction_px,
+            warnings=warnings_local,
+        )
+
+    n_attempts = 1 if manual_translation is not None else max_full_attempts
+    best = None
+    all_warnings = []
+    attempt_num = 0
+    for attempt_num in range(1, n_attempts + 1):
+        result = one_attempt(attempt_num)
+        all_warnings.extend(f"[attempt {attempt_num}] {w}" for w in result["warnings"])
+        is_better = (
+            best is None
+            or (result["ok"] and not best["ok"])
+            or (result["ok"] == best["ok"] and result["max_correction_px"] < best["max_correction_px"])
+        )
+        if is_better:
+            best = result
+        if result["ok"]:
+            if attempt_num > 1:
+                msg = (f"attempt(s) 1-{attempt_num - 1} did not pass the local-warp-correction "
+                       f"quality check but attempt {attempt_num} did -- using it.")
+                print(f"NOTE: {msg}")
+                all_warnings.append(msg)
+            break
+    else:
+        msg = (f"none of {n_attempts} full attempts (orientation + coarse fit + local "
+               "refinement) passed the quality check (max local-warp correction <= "
+               f"{max_correction_threshold_px:.1f}px and raw_valid_frac >= "
+               f"{min_raw_valid_frac:.0%}) -- using the best attempt found "
+               f"(max_correction={best['max_correction_px']:.1f}px, "
+               f"raw_valid_frac={best['raw_valid_frac']:.1%}). Do NOT trust this run without "
+               "inspecting the QC report/warp-quiver plot; consider widening "
+               "--rotation-search-deg or investigating this sample manually.")
+        print(f"WARNING: {msg}")
+        all_warnings.append(msg)
+
+    warnings = all_warnings
+    orientation_matrix = best["orientation_matrix"]
+    hires_gray = best["hires_gray"]
+    hires_rgb = best["hires_rgb"]
+    m = best["m"]
+    scale_x, scale_y, angle = best["scale_x"], best["scale_y"], best["angle"]
+    used_phase_fallback = best["used_phase_fallback"]
+    rotation_correction_deg = best["rotation_correction_deg"]
+    raw_valid = best["raw_valid"]
+    matrices_np = best["matrices_np"]
+    n_overridden = best["n_overridden"]
+    gr, gc = best["grid_shape"]
+    max_correction_px = best["max_correction_px"]
+    median_correction_px = best["median_correction_px"]
 
     npz_path = output_dir / f"{sample}_transform.npz"
     np.savez_compressed(
         npz_path,
         block_affine_matrices=matrices_np,
         coarse_affine_matrix=m,
-        grid_shape=np.asarray(aligner.grid_shape),
+        grid_shape=np.asarray([gr, gc]),
         block_step=block_step,
         block_size=block_size,
         ref_shape=np.asarray(cyt_rgb.shape[:2]),
@@ -621,6 +676,8 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
     # Quick CytAssist-resolution preview, for a fast visual/coverage sanity
     # check. Uses the CORRECTED matrices (with the tissue-free-block
     # override applied above), not palom's original per-block matrices.
+    chunk = (block_step, block_step)
+    cyt_gray_da = da.from_array(cyt_gray, chunks=chunk)
     matrices_corrected = da.from_array(matrices_np, chunks=3)
     hires_color_chw = da.from_array(np.moveaxis(hires_rgb, -1, 0), chunks=(1,) + chunk)
     warped = palom.align.block_affine_transformed_moving_img(
@@ -636,7 +693,6 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
                                  output_path=str(preview_path), pixel_size=cyt_um_per_px)
     print(f"Wrote {preview_path}")
 
-    gr, gc = aligner.grid_shape
     stats = {
         "sample": sample, "hires_path": str(hires_path), "cytassist_path": str(cytassist_path),
         "cyt_um_per_px": cyt_um_per_px, "block_step": block_step, "block_size": block_size,
@@ -648,7 +704,10 @@ def main(hires_path, cytassist_path, output_dir, sample="sample",
         "coarse_translation": [float(m[0, 2]), float(m[1, 2])],
         "grid_shape": [int(gr), int(gc)],
         "n_blocks_total": int(gr * gc), "n_blocks_valid_raw": int(raw_valid.sum()),
-        "n_blocks_overridden": n_overridden, "coverage": float(coverage), "warnings": warnings,
+        "n_blocks_overridden": n_overridden, "coverage": float(coverage),
+        "max_correction_px": max_correction_px, "median_correction_px": median_correction_px,
+        "quality_check_passed": bool(best["ok"]), "n_full_attempts_used": attempt_num,
+        "warnings": warnings,
     }
     stats_path = output_dir / f"{sample}_run_stats.json"
     stats_path.write_text(json.dumps(stats, indent=2))
@@ -698,6 +757,36 @@ if __name__ == "__main__":
                     help="where <sample>_pipeline.log lives; default: --output-dir. Set "
                          "explicitly when a stage's own --output-dir isn't the shared "
                          "per-sample directory (run_pipeline.py always sets this).")
+    p.add_argument("--max-full-attempts", type=int, default=6,
+                    help="max number of full (orientation + coarse-fit + local-refinement) "
+                         "attempts before giving up and using the best one found. Both "
+                         "match_test_flip_rotate and the ORB+RANSAC coarse fit are known "
+                         "(2026-09-27) to be non-deterministic run-to-run on identical inputs; "
+                         "this retries the whole thing, not just the ORB step, since a wrong "
+                         "orientation choice needs a fresh match_test_flip_rotate call to "
+                         "correct, not just a fresh ORB draw. Ignored (1 attempt only) when "
+                         "--manual-translation is given, since that path is already "
+                         "deterministic. Default 6.")
+    p.add_argument("--max-correction-threshold-px", type=float, default=25.0,
+                    help="an attempt is rejected (and retried, up to --max-full-attempts) if "
+                         "its max per-block local-warp correction, among blocks with real raw "
+                         "signal, exceeds this many px at CytAssist scale. Real physical tissue "
+                         "distortion is small; a spurious local match papering over a wrong "
+                         "coarse/orientation choice is not. Checked empirically on this "
+                         "project's real data (2026-09-27): confirmed-correct runs measured "
+                         "3.6-10.8px max, one confirmed-wrong run measured 57.7px max -- 25.0 "
+                         "sits comfortably between the two. Prefer this over raw_valid_frac as "
+                         "a quality gate: on repetitive tissue a wrong global alignment can "
+                         "still find plenty of raw local matches (just wrong, far-away ones), "
+                         "so raw_valid_frac alone is not reliable (one confirmed-wrong run had "
+                         "raw_valid_frac=89.8%, HIGHER than its own correct run's 64.3%).")
+    p.add_argument("--min-raw-valid-frac", type=float, default=0.2,
+                    help="an attempt is also rejected if fewer than this fraction of blocks "
+                         "find any raw local signal at all (catches near-total local-matching "
+                         "failure, e.g. a 90-degree-wrong orientation choice, which the "
+                         "correction-magnitude check alone would not: with almost no valid "
+                         "blocks there's little magnitude to measure in the first place). "
+                         "Default 0.2.")
     args = p.parse_args()
     setup_pipeline_log(args.log_dir or args.output_dir, args.sample, "register.py")
     if args.source_dir:
@@ -708,4 +797,7 @@ if __name__ == "__main__":
          scale_tol=args.scale_tol, extra_mirror_x=args.extra_mirror_x,
          manual_translation=tuple(args.manual_translation) if args.manual_translation else None,
          rotation_search_deg=args.rotation_search_deg, rotation_search_step=args.rotation_search_step,
-         manual_translation_search_margin=args.manual_translation_search_margin)
+         manual_translation_search_margin=args.manual_translation_search_margin,
+         max_full_attempts=args.max_full_attempts,
+         max_correction_threshold_px=args.max_correction_threshold_px,
+         min_raw_valid_frac=args.min_raw_valid_frac)
